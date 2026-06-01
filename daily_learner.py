@@ -214,6 +214,20 @@ def analyze_prev_day(ticker: str, surge_date_str: str | None = None) -> dict | N
             'VolRatio':    float(latest.get('VolRatio', 0) or 0),
         }
 
+        # ── DART 공시 피처 (급등 원인 분류용) ──────────────────────────────
+        dart_info   = {}
+        dart_impact = {}
+        try:
+            from dart_utils import get_dart_disclosures, classify_dart_impact
+            surge_date_for_dart = (
+                datetime.strptime(surge_date_str, '%Y%m%d').strftime('%Y-%m-%d')
+                if surge_date_str else datetime.now().strftime('%Y-%m-%d')
+            )
+            dart_info   = get_dart_disclosures(ticker, surge_date_for_dart, lookback_days=3)
+            dart_impact = classify_dart_impact(dart_info)
+        except Exception:
+            pass
+
         return {
             'ticker':   ticker,
             'name':     get_name(ticker),
@@ -230,6 +244,16 @@ def analyze_prev_day(ticker: str, surge_date_str: str | None = None) -> dict | N
                 'surge':    g_tags[:3],
                 'investor': [t for t in inv_tags if not t.startswith('수급데이터')][:3],
                 'pattern':  pat_tags[:3],
+            },
+            'dart': {
+                'has_negative':   dart_info.get('has_negative', False),
+                'has_positive':   dart_info.get('has_positive', False),
+                'has_earnings':   dart_info.get('has_earnings', False),
+                'total_count':    dart_info.get('total_count', 0),
+                'negative_title': dart_info.get('negative_title', ''),
+                'positive_title': dart_info.get('positive_title', ''),
+                'surge_type':     dart_impact.get('surge_type', 'unknown'),
+                'titles':         dart_info.get('titles', []),
             },
         }
 
@@ -323,6 +347,7 @@ def run_learning(date_str: str | None = None) -> dict | None:
                 'features':  result['features'],
                 'tags':      result['tags'],
                 'macro':     macro_feats,
+                'dart':      result.get('dart', {}),
             }
             new_obs.append(obs)
             log['observations'].append(obs)
@@ -569,6 +594,25 @@ def build_email(result: dict) -> tuple[str, str]:
                     f'  {item["label"]:<18}  [{bar}]  '
                     f'{item["rate"]*100:5.1f}%  ({item["count"]}/{upd["window"]}건)'
                 )
+            L.append(sep2)
+
+        # DART 공시 통계 (오늘 급등 종목의 공시 유형 분포)
+        dart_obs = [o for o in result.get('new_obs', []) if o.get('dart')]
+        if dart_obs:
+            neg_cnt  = sum(1 for o in dart_obs if o['dart'].get('has_negative'))
+            pos_cnt  = sum(1 for o in dart_obs if o['dart'].get('has_positive'))
+            earn_cnt = sum(1 for o in dart_obs if o['dart'].get('has_earnings'))
+            tech_cnt = sum(1 for o in dart_obs if o['dart'].get('surge_type') == 'technical')
+            n        = len(dart_obs)
+            L += ['', '  [ DART 공시 기반 급등 원인 분류 ]', sep2]
+            L.append(f'  공시 기술적 급등:  {tech_cnt}/{n} ({tech_cnt/n*100:.0f}%) ← 공시 없이 세력 작업')
+            L.append(f'  실적 주도 급등:    {earn_cnt}/{n} ({earn_cnt/n*100:.0f}%)')
+            L.append(f'  긍정공시 주도:     {pos_cnt}/{n} ({pos_cnt/n*100:.0f}%)')
+            L.append(f'  부정공시 후 급등:  {neg_cnt}/{n} ({neg_cnt/n*100:.0f}%) ← 희석/차입 후 단기급등 주의')
+            # 부정공시 종목 목록
+            neg_obs = [o for o in dart_obs if o['dart'].get('has_negative')]
+            if neg_obs:
+                L.append(f'  ⚠ 부정공시 종목: {", ".join(o["name"] for o in neg_obs[:3])}')
             L.append(sep2)
 
         # 누적 가중치 이력 (최근 5회)

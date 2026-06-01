@@ -327,72 +327,22 @@ _POSITIVE_KEYWORDS = [
 
 
 def get_dart_flags(ticker: str, days: int = 3) -> dict:
-    """
-    DART 공시에서 부정/긍정 신호 필터.
-
-    Returns:
-        has_negative : 부정 공시 존재 여부
-        has_positive : 긍정 공시 존재 여부
-        disclosures  : 최근 공시 리스트
-        signal       : 태그 문자열
-    """
-    result = {'has_negative': False, 'has_positive': False,
-              'disclosures': [], 'signal': ''}
+    """dart_utils 모듈 위임 — 공시 긍/부정 분류."""
     try:
-        import dart_fss as dart
-        from datetime import datetime, timedelta
-
-        # API 키 로드 (dart_config.json 또는 환경변수)
-        api_key = _load_dart_api_key()
-        if not api_key:
-            return result
-
-        dart.set_api_key(api_key)
-        end_dt   = datetime.now()
-        start_dt = end_dt - timedelta(days=days)
-
-        corp = dart.get_corp(stock_code=ticker)
-        if not corp:
-            return result
-
-        filings = corp.search_filings(
-            bgn_de=start_dt.strftime('%Y%m%d'),
-            end_de=end_dt.strftime('%Y%m%d'),
-        )
-        if not filings:
-            return result
-
-        titles = [f.get('report_nm', '') for f in filings[:10]]
-        result['disclosures'] = titles
-
-        neg = [t for t in titles if any(kw in t for kw in _NEGATIVE_KEYWORDS)]
-        pos = [t for t in titles if any(kw in t for kw in _POSITIVE_KEYWORDS)]
-
-        if neg:
-            result['has_negative'] = True
-            result['signal'] = f'⚠ 부정공시: {neg[0][:20]}'
-        elif pos:
-            result['has_positive'] = True
-            result['signal'] = f'✅ 긍정공시: {pos[0][:20]}'
-
+        from dart_utils import get_dart_disclosures, classify_dart_impact
+        today = datetime.now().strftime('%Y-%m-%d')
+        info   = get_dart_disclosures(ticker, today, lookback_days=days)
+        impact = classify_dart_impact(info)
+        return {
+            'has_negative': info.get('has_negative', False),
+            'has_positive': info.get('has_positive', False),
+            'disclosures':  info.get('titles', []),
+            'signal':       impact.get('signal', ''),
+            'surge_type':   impact.get('surge_type', 'unknown'),
+        }
     except Exception:
-        pass
-    return result
-
-
-def _load_dart_api_key() -> Optional[str]:
-    """DART API 키 로드 (dart_config.json 또는 환경변수)"""
-    import os
-    key = os.environ.get('DART_API_KEY')
-    if key:
-        return key
-    cfg_path = Path(__file__).parent / 'dart_config.json'
-    if cfg_path.exists():
-        try:
-            return json.loads(cfg_path.read_text())['api_key']
-        except Exception:
-            pass
-    return None
+        return {'has_negative': False, 'has_positive': False,
+                'disclosures': [], 'signal': '', 'surge_type': 'unknown'}
 
 
 # ── 4. 통합 리포트 ────────────────────────────────────────────────────────────
