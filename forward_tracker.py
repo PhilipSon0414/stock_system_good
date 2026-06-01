@@ -7,7 +7,7 @@
   3. 20 거래일 경과 후 compute_stats()로 점수대별 적중률 계산
   4. build_tracker_section()으로 이메일 섹션 생성
 
-적중 기준: 점수 기록 이후 N 거래일 내 해당 종목이 단일 거래일 15%+ 급등
+적중 기준: 점수 기록 이후 N 거래일 내 해당 종목이 단일 거래일 10%+ 급등
 거래일 계산: 주말 제외 (공휴일은 미적용, 근사값)
 """
 
@@ -132,7 +132,7 @@ def update_outcomes(surge_tickers: list[str], surge_date: str | None = None):
     """
     daily_learner.py가 수집한 급등 종목으로 과거 예측 기록 업데이트.
 
-    surge_date 날 15%+ 급등한 종목이 과거 5/10/20 거래일 내 스캔된 적 있으면
+    surge_date 날 10%+ 급등한 종목이 과거 5/10/20 거래일 내 스캔된 적 있으면
     해당 기록에 surged_by_Nd = True 마킹.
     윈도우가 만료된 기록(아직 null)은 False 처리.
 
@@ -253,7 +253,7 @@ def build_tracker_section() -> list[str]:
     lines = [
         '',
         sep,
-        '  [ 세력 점수대별 급등(15%+) 적중률 — ML 학습 데이터 누적 현황 ]',
+        '  [ 세력 점수대별 급등(10%+) 적중률 — ML 학습 데이터 누적 현황 ]',
         f'  분석 기간: {stats["oldest_scan"]} ~ {stats["latest_scan"]}'
         f'  |  완료: {stats["total_completed"]}건 / 전체: {stats["total_records"]}건',
         sep2,
@@ -275,7 +275,7 @@ def build_tracker_section() -> list[str]:
 
     lines += [
         sep2,
-        '  ※ 기준: 스캔일 이후 N 거래일 내 단일일 15%+ 급등 발생 여부',
+        '  ※ 기준: 스캔일 이후 N 거래일 내 단일일 10%+ 급등 발생 여부',
         '  ※ 세력80+합산45+ Tier-S: 예상 적중률 18.6% (2.68x lift) — 핵심 필터',
         sep,
     ]

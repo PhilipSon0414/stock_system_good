@@ -105,16 +105,19 @@ TOP_N_REPORT             = 50         # 전체 순위 50개
 TOP_N_DETAIL             = 20         # 상세 분석 상위 20개
 
 SCORE_HISTORY_PATH       = Path(__file__).parent / 'score_history.json'
-PERSISTENCE_BONUS_TABLE  = {1: 10, 2: 10, 3: 20, 4: 30}  # 연속일 → 보너스점수 (4일+는 30)
+# 연속 보너스 — 10% 기준 재검증: 합산 70+ 가 오히려 lift 0.52x (연속보너스 허수)
+# → 보너스 최대치 하향 조정 (4일+: 30→20, 3일+: 20→12)
+PERSISTENCE_BONUS_TABLE  = {1: 8, 2: 8, 3: 12, 4: 20}
 
-# 엘리트 픽 기준 (백테스트: 세력90+이 실제 급등 종목 D-1 공통 패턴)
-ELITE_SE_TIER1  = 90    # 세력 90+ + 급등 65+
-ELITE_SG_TIER1  = 65
-ELITE_SE_TIER2  = 80    # 세력 80+ + 거래량 3x+
-ELITE_VOL_TIER2 = 3.0
+# 엘리트 픽 기준 — 10% 검증: 세력 80+ 핵심 (1.92x lift)
+# 세력 60-69는 노이즈, 합산 점수보다 세력 점수 우선
+ELITE_SE_TIER1  = 90    # 세력 90+ + 급등 60+
+ELITE_SG_TIER1  = 60    # 65→60 (10% 기준 완화)
+ELITE_SE_TIER2  = 80    # 세력 80+ + 거래량 2x+
+ELITE_VOL_TIER2 = 2.0   # 3x→2x (더 많은 포착)
 ELITE_SE_TIER3  = 75    # 세력 75+ + 연속 3일+
 ELITE_CONSEC_TIER3 = 3
-ELITE_SG_TIER4  = 80    # 급등 80+ + 연속 2일+
+ELITE_SG_TIER4  = 75    # 급등 75+ + 연속 2일+ (80→75)
 ELITE_CONSEC_TIER4 = 2
 
 

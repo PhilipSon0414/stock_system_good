@@ -38,7 +38,7 @@ SCRIPT_DIR       = Path(__file__).parent
 LOG_DIR          = SCRIPT_DIR / 'logs'
 LOG_DIR.mkdir(exist_ok=True)
 
-MIN_SURGE_PCT        = 15.0   # 학습 대상 최소 급등률 (%)
+MIN_SURGE_PCT        = 10.0   # 학습 대상 최소 급등률 (%) — 15%→10% 낮춤으로 샘플 확대
 MIN_OBS_FOR_UPDATE   = 10     # 가중치 업데이트 최소 관측 수
 MAX_ANALYZE_STOCKS   = 50     # 분석 최대 종목 수 (과부하 방지)
 

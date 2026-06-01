@@ -188,13 +188,15 @@ def score_surge_with_history(df: pd.DataFrame, ob_info: dict,
                               score_history: list[dict]) -> tuple[int, list[str]]:
     """score_history(최근 스캔 기록)를 반영한 급등 점수.
 
-    score_history: [{'combined': int, 'seoryeok': int, 'surge': int}, ...] 최신순 정렬
-    백테스트 결과 반영:
-      - co_mean ≥ 54 & co_slope ≥ 3  → +20pt (lift 6.0x)
-      - 세력 ≥ 75 & co_mean ≥ 54      → +15pt (lift 5.0x)
-      - 세력 ≥ 70 & 전일합산+5 & co_mean ≥ 45 → +15pt (lift 5.0x)
+    10% 기준 재검증 결과 반영 (2026-06):
+      - 세력≥80 & 합산≥45  → lift 1.92x (핵심)
+      - 세력 60-69          → lift 0.62x (노이즈 — 패널티)
+      - 합산 70+            → lift 0.52x (연속보너스 허수 — 패널티)
+      - co_mean ≥ 54 & co_slope ≥ 3  → +20pt (이전 기준 유지)
+      - 세력 ≥ 75 & co_mean ≥ 54      → +15pt
+      - 세력 ≥ 70 & 전일합산+5 & co_mean ≥ 45 → +15pt
       - co_slope < 0 (하락 추세)       → -10pt
-      - 연속 등장 5일 이상             → -15pt (lift 0.00x 확인)
+      - 연속 등장 5일 이상             → 페널티
     """
     base_pts, base_tags = score_surge(df, ob_info)
 
@@ -238,10 +240,20 @@ def score_surge_with_history(df: pd.DataFrame, ob_info: dict,
         bonus += 15
         bonus_tags.append(f'★ 세력{se_last}+전일+{co_d1_chg}+평균{co_mean:.0f} (R8 패턴)')
 
-    # 기울기 양수 보너스 (소폭)
-    elif co_slope >= 2 and se_last >= 65:
+    # 기울기 양수 보너스 (소폭, 세력 70+만)
+    elif co_slope >= 2 and se_last >= 70:
         bonus += 8
         bonus_tags.append(f'기울기 상승세 (+{co_slope:.1f}/일)')
+
+    # ── 10% 검증 기반 노이즈 패널티 ──────────────────────────────────
+    # 세력 60-69: lift 0.62x → 페널티
+    if 60 <= se_last < 70:
+        bonus -= 5
+        bonus_tags.append(f'⚠ 세력{se_last} 노이즈 구간 (60-69 lift 0.62x)')
+    # 합산 70+: lift 0.52x → 연속보너스 허수 패널티
+    if co_last >= 70:
+        bonus -= 8
+        bonus_tags.append(f'⚠ 합산{co_last} 고점 (연속보너스 허수, lift 0.52x)')
 
     # ── 페널티 규칙 ─────────────────────────────────────────────────────
     # 기울기 음수: 합산 점수 하락 추세
