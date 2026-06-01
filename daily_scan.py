@@ -478,6 +478,220 @@ def run_scan(market: str = 'ALL') -> list:
     return results
 
 
+def _calc_ob_trade_params(ob: dict, price: float, r: dict) -> dict:
+    """OB 기반 진입가·목표가·손절가·기대수익률 계산.
+
+    진입전략:
+      - 강세OB 진입 중 or OB플립 지지 → 현재가 진입
+      - 강세OB 5% 이내 접근 → OB 상단 근처 눌림목 대기
+      - 세력80+ & MA20 위 → 즉시 진입
+
+    목표가 산출 우선순위:
+      1. 가장 가까운 약세OB (저항) 하단
+      2. 52주 신고가
+      3. 기본 +10% (데이터 없을 때)
+
+    손절가: 강세OB 하단 또는 현재가 -5%
+    """
+    result = {
+        'entry':    price,
+        'target':   None,
+        'stop':     None,
+        'rr_ratio': None,
+        'expected_return': None,
+        'entry_desc': '',
+        'target_desc': '',
+        'stop_desc': '',
+    }
+
+    seoryeok = r.get('seoryeok', 0)
+    pvm      = r.get('price_vs_ma20')
+    ml_tier  = r.get('ml_tier', {}).get('tier', 'D')
+    combined = r.get('combined', 0)
+
+    # ── 진입가 결정 ──────────────────────────────────────────────
+    bull_dist = ob.get('nearest_bull_dist')
+    flip_dist = ob.get('nearest_flipped_dist')
+    bull_obs  = sorted(ob.get('bull', []), key=lambda x: abs(price - x['Mid']))
+    flip_obs  = sorted(ob.get('flipped_bear', []), key=lambda x: abs(price - x['High']))
+
+    if bull_dist is not None and bull_dist == 0.0:
+        # 강세OB 안에 있음 → 현재가 진입
+        result['entry'] = price
+        result['entry_desc'] = f'강세OB 진입 중 → 현재가({price:,.0f}원) 즉시 진입'
+    elif flip_dist is not None and flip_dist < 0.03:
+        # OB 플립 지지 위 → 현재가 진입
+        result['entry'] = price
+        result['entry_desc'] = f'OB플립 지지({flip_dist*100:.1f}% 위) → 현재가 진입'
+    elif bull_obs and bull_dist is not None and bull_dist < 0.05:
+        # 강세OB 5% 이내 접근 → OB 상단(High)까지 눌림목 대기
+        ob_high = bull_obs[0]['High']
+        if ob_high < price:  # 이미 OB 위에 있음
+            result['entry'] = price
+            result['entry_desc'] = f'강세OB 상단({ob_high:,.0f}원) 돌파 확인 → 현재가 진입'
+        else:
+            result['entry'] = ob_high
+            result['entry_desc'] = f'강세OB 상단({ob_high:,.0f}원) 눌림목 대기 (현재가 {price:,.0f}원)'
+    elif pvm is not None and pvm >= 0 and seoryeok >= 80:
+        result['entry'] = price
+        result['entry_desc'] = f'세력{seoryeok}+ MA20 위 → 현재가 즉시 진입'
+    else:
+        result['entry'] = price
+        result['entry_desc'] = f'현재가 진입 (추가 확인 권장)'
+
+    entry = result['entry']
+
+    # ── 목표가 결정 ──────────────────────────────────────────────
+    # 1순위: 가장 가까운 위쪽 약세OB
+    bear_obs = [b for b in ob.get('bear', []) if b['Low'] > entry]
+    bear_obs_sorted = sorted(bear_obs, key=lambda x: x['Low'])
+
+    df = r.get('df')
+    high52w = None
+    if df is not None and 'High52W' in df.columns:
+        high52w = float(df['High52W'].iloc[-1])
+
+    if bear_obs_sorted:
+        target = bear_obs_sorted[0]['Low'] * 0.99  # 저항 직전 99%
+        result['target']      = int(target)
+        result['target_desc'] = f'약세OB 저항({bear_obs_sorted[0]["Low"]:,.0f}원) 직전 목표'
+    elif high52w and high52w > entry * 1.03:
+        result['target']      = int(high52w * 0.99)
+        result['target_desc'] = f'52주 신고가({high52w:,.0f}원) 근접 목표'
+    else:
+        # 기본: Tier에 따라 목표 수익률 다르게
+        target_pct = {'S': 0.15, 'A': 0.12, 'B': 0.10, 'C': 0.08, 'D': 0.08}.get(ml_tier, 0.10)
+        result['target']      = int(entry * (1 + target_pct))
+        result['target_desc'] = f'기본 목표 +{target_pct*100:.0f}% (OB 데이터 없음)'
+
+    # ── 손절가 결정 ──────────────────────────────────────────────
+    if bull_obs:
+        ob_low = bull_obs[0]['Low']
+        if ob_low < entry:
+            result['stop']      = int(ob_low * 0.99)
+            result['stop_desc'] = f'강세OB 하단({ob_low:,.0f}원) -1% 손절'
+        else:
+            result['stop']      = int(entry * 0.95)
+            result['stop_desc'] = f'기본 -5% 손절'
+    elif flip_obs:
+        flip_low = flip_obs[0]['Low']
+        result['stop']      = int(flip_low * 0.99)
+        result['stop_desc'] = f'OB플립 하단({flip_low:,.0f}원) 이탈 시 손절'
+    else:
+        result['stop']      = int(entry * 0.95)
+        result['stop_desc'] = f'기본 -5% 손절'
+
+    # ── 기대수익률 · R:R 계산 ────────────────────────────────────
+    if result['target'] and result['stop']:
+        profit   = result['target'] - entry
+        risk     = entry - result['stop']
+        if risk > 0:
+            result['rr_ratio']        = round(profit / risk, 2)
+            result['expected_return'] = round(profit / entry * 100, 1)
+
+    return result
+
+
+def _build_recommendation_rationale(r: dict, ob_params: dict) -> list[str]:
+    """추천 근거 상세 텍스트 생성."""
+    lines = []
+    se    = r.get('seoryeok', 0)
+    sg    = r.get('surge', 0)
+    inv   = r.get('investor', 0)
+    vr    = r.get('vol_ratio', 0) or 0
+    pvm   = r.get('price_vs_ma20')
+    ml    = r.get('ml_tier', {})
+    tf    = r.get('triple_filter', {})
+    dart  = r.get('dart_info', {})
+    consec= r.get('consec_days', 0)
+
+    # 핵심 근거 (양성)
+    strengths = []
+    if se >= 80:
+        strengths.append(f'세력{se}점 (10%급등 예상적중 {ml.get("hit_rate",0)*100:.0f}%)')
+    elif se >= 70:
+        strengths.append(f'세력{se}점 (유의미 신호)')
+
+    # 이평선 위치
+    if pvm is not None:
+        if pvm >= 5:
+            strengths.append(f'MA20 위 {pvm:+.1f}% (상승 추세 확인)')
+        elif pvm >= 0:
+            strengths.append(f'MA20 위 {pvm:+.1f}% (추세 돌파)')
+        elif pvm >= -5:
+            strengths.append(f'MA20 근접 {pvm:+.1f}% (돌파 시도)')
+
+    # 거래량
+    if vr >= 3.0:
+        strengths.append(f'거래량 {vr:.1f}x 폭발 (세력 진입 확인)')
+    elif vr >= 2.0:
+        strengths.append(f'거래량 {vr:.1f}x 상승')
+    elif vr < 0.4:
+        strengths.append(f'거래량 {vr:.1f}x 극압축 (급등 직전 잠복 패턴)')
+
+    # 연속 등장
+    if 2 <= consec <= 4:
+        strengths.append(f'{consec}일 연속 등장 (지속 세력 확인)')
+    elif consec >= 5:
+        strengths.append(f'{consec}일 연속 (시그널 약화 주의)')
+
+    # 트리플 필터
+    tf_score = tf.get('score', 0)
+    if tf_score == 3:
+        strengths.append('★ 트리플필터 통과 (공매도↓+기관매수+거래량)')
+    elif tf_score == 2:
+        strengths.append('더블필터 통과 (2/3 조건)')
+
+    # 기관 전환
+    inv_stats = r.get('_investor_stats', {})
+    if inv_stats.get('inst_transition'):
+        strengths.append('★ 기관 순매도→매수 전환')
+    if inv_stats.get('frgn_transition'):
+        strengths.append('★ 외국인 순매도→매수 전환')
+    if inv_stats.get('combo_buy_days', 0) >= 3:
+        strengths.append(f'기관+외국인 동시매수 {inv_stats["combo_buy_days"]}일')
+
+    # OB 상황
+    ob = r.get('ob', {})
+    if ob.get('nearest_bull_dist') == 0.0:
+        strengths.append('강세OB 내 진입 (최적 지지)')
+    elif ob.get('nearest_bull_dist') is not None and ob['nearest_bull_dist'] < 0.03:
+        strengths.append(f'강세OB 근접 ({ob["nearest_bull_dist"]*100:.1f}% 내)')
+
+    # DART 공시
+    if dart.get('has_positive'):
+        strengths.append(f"✅ 긍정공시: {dart.get('positive_title','')[:15]}")
+    if dart.get('has_negative'):
+        strengths.append(f"⚠ 부정공시 주의: {dart.get('negative_title','')[:15]}")
+
+    # 약점
+    warnings = []
+    if pvm is not None and pvm < -10:
+        warnings.append(f'현재가 MA20 -{abs(pvm):.0f}% 이탈 (하락 추세)')
+    if consec >= 5:
+        warnings.append(f'연속{consec}일 → 급등 시그널 약화')
+    if dart.get('has_negative'):
+        warnings.append('부정공시 → 희석/차입 위험')
+
+    # 포매팅
+    lines.append(f'       ┌─ 추천 근거 {"─"*45}')
+    for s in strengths[:5]:
+        lines.append(f'       │  ✓ {s}')
+    for w in warnings[:2]:
+        lines.append(f'       │  ⚠ {w}')
+
+    # OB 진입 파라미터
+    if ob_params and ob_params.get('rr_ratio'):
+        lines.append(f'       ├─ OB 기반 매매 전략 {"─"*40}')
+        lines.append(f'       │  진입가: {ob_params["entry"]:>10,.0f}원  ← {ob_params["entry_desc"][:30]}')
+        lines.append(f'       │  목표가: {ob_params["target"]:>10,.0f}원  ({ob_params["expected_return"]:+.1f}%)  ← {ob_params["target_desc"][:28]}')
+        lines.append(f'       │  손절가: {ob_params["stop"]:>10,.0f}원  ({(ob_params["stop"]-ob_params["entry"])/ob_params["entry"]*100:+.1f}%)  ← {ob_params["stop_desc"][:28]}')
+        lines.append(f'       │  리스크·리워드: {ob_params["rr_ratio"]:.1f}:1  {"✅ 유리" if ob_params["rr_ratio"] >= 2 else ("⚠ 보통" if ob_params["rr_ratio"] >= 1 else "❌ 불리")}')
+    lines.append(f'       └{"─"*56}')
+
+    return lines
+
+
 def _format_ob_lines(ob: dict, price: float) -> list:
     """오더블록 정보를 리포트 라인으로 변환"""
     lines = []
@@ -757,9 +971,21 @@ def build_report(results: list, scan_market: str) -> str:
     for rank, r in enumerate(results[:TOP_N_DETAIL], 1):
         inv  = r.get('investor', 0)
         pat  = r.get('pattern', 0)
-        lines.append(f'\n  {rank:>2}위. {r["name"]} ({r["ticker"]})')
+        c    = r['combined']
+
+        # 투자 판단
+        if c >= 70:
+            verdict = '★★★ 매수 적극 검토'
+        elif c >= 55:
+            verdict = '★★  매수 검토'
+        elif c >= 40:
+            verdict = '★   관망 / 모니터링'
+        else:
+            verdict = '    매수 보류'
+
+        lines.append(f'\n  {rank:>2}위. {r["name"]} ({r["ticker"]})  [{verdict}]')
         lines.append(
-            f'       합산:{r["combined"]:>3}점  세력:{r["seoryeok"]:>3}점  '
+            f'       합산:{c:>3}점  세력:{r["seoryeok"]:>3}점  '
             f'급등:{r["surge"]:>3}점  수급:{inv:>3}점  패턴:{pat:>3}점'
         )
         ai = r.get('accum_info', {})
@@ -786,6 +1012,12 @@ def build_report(results: list, scan_market: str) -> str:
         # 재무지표
         fin = r.get('fin', {})
         lines.append(f'       재무:  {fmt_financials(fin)}')
+
+        # ── 상세 추천 근거 + OB 매매 전략 ─────────────────────────────
+        ob_params = {}
+        if c >= 55:   # 매수검토 이상만 OB 계산
+            ob_params = _calc_ob_trade_params(r.get('ob', {}), r['price'], r)
+        lines.extend(_build_recommendation_rationale(r, ob_params if c >= 55 else {}))
 
         # 세력 신호
         s_str = ' | '.join(r['s_tags'][:3])
@@ -846,17 +1078,6 @@ def build_report(results: list, scan_market: str) -> str:
         if entry:
             lines.append(f'       진입전략: {entry}')
 
-        # 투자 판단
-        c = r['combined']
-        if c >= 70:
-            verdict = '★★★ 매수 적극 검토'
-        elif c >= 55:
-            verdict = '★★  매수 검토'
-        elif c >= 40:
-            verdict = '★   관망 / 모니터링'
-        else:
-            verdict = '    매수 보류'
-        lines.append(f'       판단: {verdict}')
         lines.append(f'       {sep2}')
 
     # 앙상블 스코어링 섹션
