@@ -37,13 +37,15 @@ from triple_filter import scan_triple_filter
 from ensemble_scan import run_ensemble, build_ensemble_report_section
 from investor_flow import get_investor_flow_stats
 from sector_momentum import get_sector_rs
+from macro_context import get_full_macro_context, build_macro_report_lines, get_dart_flags
 
 REPORTS_DIR = Path(__file__).parent / 'reports'
 
 
 def get_market_context() -> dict:
-    """4순위: 코스피/코스닥 추세 + 20일 RS 기준값"""
-    ctx = {'kospi_5d': 0.0, 'kosdaq_5d': 0.0, 'kospi_20d': 0.0, 'warning': False, 'desc': ''}
+    """코스피/코스닥 추세 + 매크로 외부 지표 통합 컨텍스트"""
+    ctx = {'kospi_5d': 0.0, 'kosdaq_5d': 0.0, 'kospi_20d': 0.0,
+           'warning': False, 'desc': '', 'macro': {}}
     try:
         idx = get_ohlcv('KS11', period_days=30)
         if len(idx) >= 5:
@@ -58,14 +60,35 @@ def get_market_context() -> dict:
                 (idx2['Close'].iloc[-1] - idx2['Close'].iloc[-5]) / idx2['Close'].iloc[-5] * 100, 2)
     except Exception:
         pass
+
     k5, q5 = ctx['kospi_5d'], ctx['kosdaq_5d']
+
+    # ── 매크로 외부 지표 수집 ─────────────────────────────────────────────
+    print('  외부 매크로 지표 수집 중...')
+    try:
+        macro = get_full_macro_context()
+        ctx['macro'] = macro
+        # 매크로 gate가 stop이면 경고 강화
+        if macro.get('gate') == 'stop':
+            ctx['warning'] = True
+        # 매크로 점수를 포함한 종합 설명
+        macro_score = macro.get('score', 0)
+        macro_regime = {'bull':'강세','neutral':'중립','bear':'약세','panic':'극도공포'}.get(
+            macro.get('regime','neutral'), '?')
+        vix = macro.get('details', {}).get('VIX', 0)
+        krw = macro.get('details', {}).get('USD_KRW', 0)
+        macro_summary = f'VIX:{vix:.0f} 원달러:{krw:.0f} 매크로{macro_score:+d}pt[{macro_regime}]'
+    except Exception as e:
+        macro_summary = ''
+        print(f'  매크로 수집 오류: {e}')
+
     if k5 < -3.0 and q5 < -3.0:
         ctx['warning'] = True
-        ctx['desc'] = f'⚠ 시장 하락장 경고 (코스피 {k5:+.1f}% / 코스닥 {q5:+.1f}%) — 개별 신호 신뢰도 저하'
+        ctx['desc'] = (f'⚠ 시장 하락장 경고 (코스피 {k5:+.1f}% / 코스닥 {q5:+.1f}%) | {macro_summary}')
     elif k5 > 2.0 and q5 > 2.0:
-        ctx['desc'] = f'✅ 시장 강세 (코스피 {k5:+.1f}% / 코스닥 {q5:+.1f}%) — 개별 신호 신뢰도 상승'
+        ctx['desc'] = (f'✅ 시장 강세 (코스피 {k5:+.1f}% / 코스닥 {q5:+.1f}%) | {macro_summary}')
     else:
-        ctx['desc'] = f'시장: 코스피 {k5:+.1f}% / 코스닥 {q5:+.1f}% (5일 등락)'
+        ctx['desc'] = (f'시장: 코스피 {k5:+.1f}% / 코스닥 {q5:+.1f}% | {macro_summary}')
     return ctx
 REPORTS_DIR.mkdir(exist_ok=True)
 
@@ -287,6 +310,9 @@ def analyze_one(ticker: str) -> dict | None:
         # ── 기관/외국인 흐름 통계 (pykrx) ──────────────────────────────
         inv_stats = get_investor_flow_stats(ticker)
 
+        # ── DART 부정 공시 필터 ──────────────────────────────────────
+        dart_info = get_dart_flags(ticker, days=3)
+
         # ── 현재가 vs MA20 위치 계산 ────────────────────────────────────
         import math as _math
         _ma20 = df['MA20'].iloc[-1] if 'MA20' in df.columns else float('nan')
@@ -342,6 +368,7 @@ def analyze_one(ticker: str) -> dict | None:
             'triple_filter':   triple,
             '_investor_stats': inv_stats,
             'sector_rs':       sector_rs,
+            'dart_info':       dart_info,
         }
     except Exception:
         return None
@@ -534,6 +561,11 @@ def build_report(results: list, scan_market: str) -> str:
     lines.append('  세력흔적 25% + 급등임박 30% + 외국인/기관 수급 25% + 차트패턴 20%')
     lines.append('  70점↑ 매수 적극 검토  |  55점↑ 매수 검토  |  40점↑ 관망')
     lines.append(f'  ML예측: {model_stats()}')
+    # 매크로 컨텍스트 섹션
+    macro = mkt_ctx.get('macro', {})
+    if macro:
+        for mline in build_macro_report_lines(macro):
+            lines.append(mline)
     lines.append('')
 
     # ── 엘리트 픽 섹션 (백테스트 검증 기준, 최우선 주목) ──────────────────────
@@ -792,6 +824,11 @@ def build_report(results: list, scan_market: str) -> str:
         tf = r.get('triple_filter', {})
         if tf.get('signal'):
             lines.append(f'       트리플필터: {tf["signal"]}')
+
+        # DART 공시
+        dart = r.get('dart_info', {})
+        if dart.get('signal'):
+            lines.append(f'       DART공시: {dart["signal"]}')
 
         # 오더블록 상세
         lines.extend(_format_ob_lines(r['ob'], r['price']))

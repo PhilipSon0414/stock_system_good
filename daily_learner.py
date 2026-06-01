@@ -254,6 +254,18 @@ def run_learning(date_str: str | None = None) -> dict | None:
     print(f'  일일 급등 학습 시작: {today_str}')
     print(f'{"="*60}')
 
+    # 매크로 컨텍스트 수집 (학습 시에도 기록)
+    macro_ctx = {}
+    try:
+        from macro_context import get_full_macro_context
+        macro_ctx = get_full_macro_context()
+        ms = macro_ctx.get('score', 0)
+        mr = macro_ctx.get('regime', '')
+        print(f'  매크로: {ms:+d}점 [{mr}] VIX={macro_ctx.get("details",{}).get("VIX",0):.0f} '
+              f'원달러={macro_ctx.get("details",{}).get("USD_KRW",0):.0f}')
+    except Exception:
+        pass
+
     # 급등 종목 수집
     print(f'\n  {today_str} {MIN_SURGE_PCT:.0f}%+ 급등 종목 조회 중...')
     surge_list = get_surge_tickers(MIN_SURGE_PCT, date_str=pykrx_str)
@@ -289,6 +301,19 @@ def run_learning(date_str: str | None = None) -> dict | None:
             continue   # 오늘 이미 기록된 종목 건너뜀
         result = analyze_prev_day(item['ticker'], surge_date_str=pykrx_str)
         if result:
+            # 매크로 피처 (학습 시점의 시장 환경 기록)
+            macro_feats = {}
+            if macro_ctx:
+                d = macro_ctx.get('details', {})
+                macro_feats = {
+                    'vix':          d.get('VIX'),
+                    'usd_krw':      d.get('USD_KRW'),
+                    'sp500_fut_1d': d.get('SP500_FUT'),
+                    'sox_1d':       d.get('SOX_1d'),
+                    'tnx':          d.get('TNX'),
+                    'macro_score':  macro_ctx.get('score'),
+                    'macro_regime': macro_ctx.get('regime'),
+                }
             obs = {
                 'date':      today_str,
                 'ticker':    item['ticker'],
@@ -297,6 +322,7 @@ def run_learning(date_str: str | None = None) -> dict | None:
                 'scores':    result['scores'],
                 'features':  result['features'],
                 'tags':      result['tags'],
+                'macro':     macro_feats,
             }
             new_obs.append(obs)
             log['observations'].append(obs)
