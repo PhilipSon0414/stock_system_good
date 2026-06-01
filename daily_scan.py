@@ -1,0 +1,1014 @@
+#!/usr/bin/env python3
+"""
+일일 세력 분석 스캔
+
+매일 저녁 8시 자동 실행:
+  1. 코스피 + 코스닥 전체 종목 순차 스캔
+  2. 세력 흔적 종목 필터링
+  3. 급상승 임박도 점수 산출 및 랭킹
+  4. 리포트 파일 저장 (reports/ 폴더)
+  5. 이메일 발송 (email_config.json 설정 시)
+
+직접 실행: python3 daily_scan.py
+"""
+
+import json
+import os
+import sys
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from data_fetcher import get_ohlcv, get_name, get_ticker_list
+from indicators import add_all
+from seoryeok import analyze
+from order_block import get_order_blocks
+from scorer import score as seoryeok_score, get_accum_info
+from surge_predictor import score_surge, score_surge_with_history, combined_score
+from investor_flow import score_investors
+from chart_patterns import score_patterns
+from email_sender import send_report
+from config import SCREEN_MIN_PRICE, SCREEN_MIN_VOLUME
+from forward_tracker import record_scores, build_tracker_section
+from financial_data import get_financials, fmt_financials, fmt_market_cap
+from short_interest import get_short_interest
+from surge_ml import get_confidence_tier, get_entry_timing, model_stats
+
+REPORTS_DIR = Path(__file__).parent / 'reports'
+
+
+def get_market_context() -> dict:
+    """4순위: 코스피/코스닥 추세 + 20일 RS 기준값"""
+    ctx = {'kospi_5d': 0.0, 'kosdaq_5d': 0.0, 'kospi_20d': 0.0, 'warning': False, 'desc': ''}
+    try:
+        idx = get_ohlcv('KS11', period_days=30)
+        if len(idx) >= 5:
+            ctx['kospi_5d'] = round(
+                (idx['Close'].iloc[-1] - idx['Close'].iloc[-5]) / idx['Close'].iloc[-5] * 100, 2)
+        if len(idx) >= 20:
+            ctx['kospi_20d'] = round(
+                (idx['Close'].iloc[-1] - idx['Close'].iloc[-20]) / idx['Close'].iloc[-20] * 100, 2)
+        idx2 = get_ohlcv('KQ11', period_days=10)
+        if len(idx2) >= 5:
+            ctx['kosdaq_5d'] = round(
+                (idx2['Close'].iloc[-1] - idx2['Close'].iloc[-5]) / idx2['Close'].iloc[-5] * 100, 2)
+    except Exception:
+        pass
+    k5, q5 = ctx['kospi_5d'], ctx['kosdaq_5d']
+    if k5 < -3.0 and q5 < -3.0:
+        ctx['warning'] = True
+        ctx['desc'] = f'⚠ 시장 하락장 경고 (코스피 {k5:+.1f}% / 코스닥 {q5:+.1f}%) — 개별 신호 신뢰도 저하'
+    elif k5 > 2.0 and q5 > 2.0:
+        ctx['desc'] = f'✅ 시장 강세 (코스피 {k5:+.1f}% / 코스닥 {q5:+.1f}%) — 개별 신호 신뢰도 상승'
+    else:
+        ctx['desc'] = f'시장: 코스피 {k5:+.1f}% / 코스닥 {q5:+.1f}% (5일 등락)'
+    return ctx
+REPORTS_DIR.mkdir(exist_ok=True)
+
+# 스캔 사전 필터 설정
+PRE_FILTER_MIN_PRICE     = 2_000      # 2천원 이상
+PRE_FILTER_MIN_VOLUME    = 50_000     # 5만주 이상
+PRE_FILTER_MAX_STOCKS    = 1_000      # 최대 종목 수 (거래량 상위)
+SEORYEOK_MIN_GATE        = 20         # 세력 흔적 최소 점수 (1차 필터)
+FINAL_MIN_COMBINED       = 35         # 최종 리포트 포함 최소 합산점수 (백테스트: 잡음 감소)
+TOP_N_REPORT             = 50         # 전체 순위 50개 (100→50: 정확도 향상)
+TOP_N_DETAIL             = 20         # 상세 분석 상위 20개
+
+SCORE_HISTORY_PATH       = Path(__file__).parent / 'score_history.json'
+PERSISTENCE_BONUS_TABLE  = {1: 10, 2: 10, 3: 20, 4: 30}  # 연속일 → 보너스점수 (4일+는 30)
+
+# 엘리트 픽 기준 (백테스트: 세력90+이 실제 급등 종목 D-1 공통 패턴)
+ELITE_SE_TIER1  = 90    # 세력 90+ + 급등 65+
+ELITE_SG_TIER1  = 65
+ELITE_SE_TIER2  = 80    # 세력 80+ + 거래량 3x+
+ELITE_VOL_TIER2 = 3.0
+ELITE_SE_TIER3  = 75    # 세력 75+ + 연속 3일+
+ELITE_CONSEC_TIER3 = 3
+ELITE_SG_TIER4  = 80    # 급등 80+ + 연속 2일+
+ELITE_CONSEC_TIER4 = 2
+
+
+def prefilter_tickers(market: str = 'ALL') -> list:
+    """StockListing 기반 사전 필터 — 분석 대상 축소"""
+    print('  종목 목록 다운로드 중...')
+    listing = get_ticker_list(market)
+    if listing.empty:
+        print('  ⚠ 종목 목록 없음. 네트워크 확인 요망.')
+        return []
+
+    df = listing.copy()
+
+    # 코드 정규화
+    df['Code'] = df['Code'].astype(str).str.zfill(6)
+
+    # 우선주 제외 (코드 끝자리 5 또는 7)
+    df = df[~df['Code'].str.endswith(('5', '7'))]
+
+    # 가격·거래량 필터
+    if 'Close' in df.columns:
+        df = df[df['Close'] >= PRE_FILTER_MIN_PRICE]
+    if 'Volume' in df.columns:
+        df = df[df['Volume'] >= PRE_FILTER_MIN_VOLUME]
+        df = df.sort_values('Volume', ascending=False)
+
+    # 거래량 상위 N개만
+    df = df.head(PRE_FILTER_MAX_STOCKS)
+    return list(df['Code'])
+
+
+def _get_ticker_score_history(ticker: str, limit: int = 5) -> list[dict]:
+    """score_history에서 특정 종목의 최근 N일 스캔 기록 반환 (최신순 → 역순).
+    반환 형식: [{'combined': int, 'seoryeok': int, 'surge': int}, ...] 오래된 것 먼저
+    """
+    if not SCORE_HISTORY_PATH.exists():
+        return []
+    try:
+        records = json.loads(SCORE_HISTORY_PATH.read_text(encoding='utf-8')).get('records', [])
+        today   = datetime.now().strftime('%Y-%m-%d')
+        hist    = sorted(
+            [r for r in records if r['ticker'] == ticker and r['scan_date'] < today],
+            key=lambda r: r['scan_date'], reverse=True
+        )[:limit]
+        return [{'combined': r['combined'], 'seoryeok': r['seoryeok'], 'surge': r['surge']}
+                for r in reversed(hist)]  # 오래된 것 먼저
+    except Exception:
+        return []
+
+
+def _get_consecutive_days() -> dict:
+    """score_history.json에서 종목별 연속 등장 일수 반환 {ticker: consecutive_days}
+    오늘 이전 스캔 날짜들 기준으로 연속성 체크 (최대 7일).
+    """
+    if not SCORE_HISTORY_PATH.exists():
+        return {}
+    try:
+        records = json.loads(SCORE_HISTORY_PATH.read_text(encoding='utf-8')).get('records', [])
+        today = datetime.now().strftime('%Y-%m-%d')
+        dates = sorted(
+            {r['scan_date'] for r in records if r['scan_date'] < today},
+            reverse=True
+        )[:7]
+        if not dates:
+            return {}
+
+        # 날짜별 ticker 집합 빌드
+        date_tickers: dict[str, set] = {}
+        for d in dates:
+            date_tickers[d] = {r['ticker'] for r in records if r['scan_date'] == d}
+
+        # 각 ticker별 최근부터 연속 등장 일수
+        all_tickers = {r['ticker'] for r in records}
+        result = {}
+        for ticker in all_tickers:
+            streak = 0
+            for d in dates:
+                if ticker in date_tickers[d]:
+                    streak += 1
+                else:
+                    break
+            if streak > 0:
+                result[ticker] = streak
+        return result
+    except Exception:
+        return {}
+
+
+def _get_elite_picks(results: list, consec_map: dict) -> list:
+    """백테스트 기반 엘리트 픽 필터.
+
+    조건 (복수 해당 가능):
+      Tier1: 세력≥90 + 급등≥65  (극강 세력 + 급등 임박)
+      Tier2: 세력≥80 + 거래량>3x (세력 포착 + 폭발형 진입)
+      Tier3: 세력≥75 + 연속3일+  (지속 세력 + 반복 확인)
+      Tier4: 급등≥80 + 연속2일+  (급등 임박 + 이중 확인)
+    """
+    elite = []
+    seen  = set()
+    for r in results:
+        ticker = r['ticker']
+        se     = r.get('seoryeok',  0)
+        sg     = r.get('surge',     0)
+        vr     = r.get('vol_ratio', 0)
+        consec = consec_map.get(ticker, 0)
+        reasons = []
+
+        if se >= ELITE_SE_TIER1 and sg >= ELITE_SG_TIER1:
+            reasons.append(f'Tier1 세력{se}+급등{sg}')
+        if se >= ELITE_SE_TIER2 and vr > ELITE_VOL_TIER2:
+            reasons.append(f'Tier2 세력{se}+거래량{vr:.1f}x')
+        if se >= ELITE_SE_TIER3 and consec >= ELITE_CONSEC_TIER3:
+            reasons.append(f'Tier3 세력{se}+{consec}일연속')
+        if sg >= ELITE_SG_TIER4 and consec >= ELITE_CONSEC_TIER4:
+            reasons.append(f'Tier4 급등{sg}+{consec}일연속')
+        # Tier5: 쇼트 스퀴즈 가능성 + 세력 진입 (5순위)
+        short = r.get('short', {})
+        if short.get('squeeze') and se >= 70:
+            reasons.append(f'Tier5 쇼트스퀴즈+세력{se}')
+
+        if reasons and ticker not in seen:
+            seen.add(ticker)
+            elite.append({**r, 'elite_reasons': reasons, 'consec': consec})
+
+    return sorted(elite, key=lambda x: (len(x['elite_reasons']), x['combined']), reverse=True)
+
+
+def analyze_one(ticker: str) -> dict | None:
+    """단일 종목 전체 분석. 실패 시 None 반환."""
+    try:
+        df = get_ohlcv(ticker, period_days=400)
+        if len(df) < 60:
+            return None
+
+        close = df['Close'].iloc[-1]
+        vol   = df['Volume'].iloc[-1]
+        if close < PRE_FILTER_MIN_PRICE or vol < PRE_FILTER_MIN_VOLUME:
+            return None
+
+        df = add_all(df)
+        df = analyze(df)
+        ob = get_order_blocks(df)
+
+        s_pts, s_tags = seoryeok_score(df, ob)
+        accum_info = get_accum_info(df)
+        if s_pts < SEORYEOK_MIN_GATE:
+            return None  # 세력 흔적 부족 → 제외
+
+        # score_history에서 직전 5일 합산/세력 이력 로드 (통계 피처용)
+        _sh_hist = _get_ticker_score_history(ticker, limit=5)
+        surge_pts, surge_tags = score_surge_with_history(df, ob, _sh_hist)
+        inv_pts,   inv_tags   = score_investors(ticker, df)
+        pat_pts,   pat_tags   = score_patterns(df)
+        combo = combined_score(s_pts, surge_pts, inv_pts, pat_pts)
+
+        if combo < FINAL_MIN_COMBINED:
+            return None
+
+        vol_ratio = round(df['VolRatio'].iloc[-1], 2) if 'VolRatio' in df.columns else 0
+        fin   = get_financials(ticker)
+        short = get_short_interest(ticker)
+
+        # ── 현재가 vs MA20 위치 계산 ────────────────────────────────────
+        import math as _math
+        _ma20 = df['MA20'].iloc[-1] if 'MA20' in df.columns else float('nan')
+        if not _math.isnan(float(_ma20)) and _ma20 > 0:
+            price_vs_ma20 = round((close - _ma20) / _ma20 * 100, 1)
+        else:
+            price_vs_ma20 = None
+
+        # ── RS vs KOSPI (20일 상대 강도) ──────────────────────────────────
+        rs_vs_market = None
+        if len(df) >= 20:
+            mkt_ctx = getattr(run_scan, '_market_ctx', {})
+            kospi_20d = mkt_ctx.get('kospi_20d', 0.0)
+            stock_20d = (close - df['Close'].iloc[-20]) / df['Close'].iloc[-20] * 100
+            rs_vs_market = round(stock_20d - kospi_20d, 1)
+
+        # ── ML 신뢰도 티어 ────────────────────────────────────────────────
+        latest_row = df.iloc[-1]
+        ml_tier = get_confidence_tier(s_pts, surge_pts, inv_pts, pat_pts, combo)
+        has_se_entry = bool(latest_row.get('SE_Entry', False))
+        consec_days  = 0  # 연속일은 run_scan 이후 보너스 적용 시점에서 업데이트됨
+        entry_timing = get_entry_timing(
+            ml_tier['tier'], vol_ratio, rs_vs_market, has_se_entry, consec_days
+        )
+
+        return {
+            'ticker':        ticker,
+            'name':          get_name(ticker),
+            'price':         close,
+            'vol_ratio':     vol_ratio,
+            'seoryeok':      s_pts,
+            'surge':         surge_pts,
+            'investor':      inv_pts,
+            'pattern':       pat_pts,
+            'combined':      combo,
+            's_tags':        s_tags,
+            'surge_tags':    surge_tags,
+            'inv_tags':      inv_tags,
+            'pat_tags':      pat_tags,
+            'df':            df,
+            'ob':            ob,
+            'accum_info':    accum_info,
+            'fin':           fin,
+            'short':         short,
+            'rs_vs_market':  rs_vs_market,
+            'ml_tier':       ml_tier,
+            'entry_timing':  entry_timing,
+            'price_vs_ma20': price_vs_ma20,
+        }
+    except Exception:
+        return None
+
+
+def run_scan(market: str = 'ALL') -> list:
+    now = datetime.now()
+    print(f'\n{"="*65}')
+    print(f'  일일 세력 분석 스캔 시작')
+    print(f'  실행 시각: {now.strftime("%Y-%m-%d %H:%M")}')
+    print(f'  대상 시장: {market}')
+    print(f'{"="*65}')
+
+    # 시장 컨텍스트 조회 (4순위)
+    mkt_ctx = get_market_context()
+    print(f'\n  [{mkt_ctx["desc"]}]')
+    run_scan._market_ctx = mkt_ctx
+
+    tickers = prefilter_tickers(market)
+    total = len(tickers)
+    if not tickers:
+        return []
+
+    print(f'\n  사전 필터 통과: {total}개 종목 분석 시작')
+    print(f'  예상 소요 시간: 약 {total // 10}분\n')
+
+    results = []
+    for i, ticker in enumerate(tickers, 1):
+        result = analyze_one(ticker)
+        if result:
+            results.append(result)
+
+        # 진행 상황 출력 (30종목마다)
+        if i % 30 == 0 or i == total:
+            pct = i / total * 100
+            bar = '█' * (i * 20 // total) + '░' * (20 - i * 20 // total)
+            print(f'  [{bar}] {pct:.0f}%  {i}/{total}  후보: {len(results)}개',
+                  end='\r')
+
+        time.sleep(0.1)
+
+    print()
+
+    # 연속 등장 보너스 적용 (스케일: 1일+10, 2일+10, 3일+20, 4일++30)
+    # ※ 이평선 하향 + 현재가 MA20 -10% 이상 이탈 시 보너스 제한 (모델 버그 수정)
+    consec_map = _get_consecutive_days()
+    if consec_map:
+        bonus_count = 0
+        for r in results:
+            days = consec_map.get(r['ticker'], 0)
+            if days >= 1:
+                bonus = PERSISTENCE_BONUS_TABLE.get(min(days, 4), 30)
+
+                # 차트 하향 시 보너스 상한 제한
+                df_r = r.get('df')
+                if df_r is not None and len(df_r) > 0:
+                    latest_r  = df_r.iloc[-1]
+                    ma20_r    = latest_r.get('MA20', float('nan'))
+                    close_r   = latest_r.get('Close', 0)
+                    import math
+                    if not math.isnan(float(ma20_r)) and ma20_r > 0:
+                        gap = (close_r - ma20_r) / ma20_r
+                        if gap < -0.10:
+                            # 현재가가 MA20 아래 10%+ → 보너스 절반
+                            bonus = bonus // 2
+                            r['s_tags'] = [f'⚠ MA20 이탈({gap*100:.0f}%)로 연속보너스 제한'] + r['s_tags']
+
+                r['combined']  = min(100, r['combined'] + bonus)
+                r['consec_days'] = days
+                label = f'★ {days}일 연속등장 보너스 (+{bonus}점)'
+                r['s_tags'] = [label] + r['s_tags']
+                bonus_count += 1
+        if bonus_count:
+            print(f'  연속등장 보너스: {bonus_count}개 종목 적용')
+
+    # 결과에 consec_map 저장 + entry_timing 재계산 (consec_days 반영)
+    for r in results:
+        r.setdefault('consec_days', consec_map.get(r['ticker'], 0))
+        # entry_timing에 consec_days 반영하여 재계산
+        ml = r.get('ml_tier', {})
+        if ml:
+            r['entry_timing'] = get_entry_timing(
+                ml['tier'],
+                r.get('vol_ratio', 0),
+                r.get('rs_vs_market'),
+                bool(r.get('df', None) is not None and r['df'].iloc[-1].get('SE_Entry', False)),
+                r.get('consec_days', 0),
+            )
+    run_scan._consec_map = consec_map   # 전달용 임시 저장
+
+    results.sort(key=lambda x: x['combined'], reverse=True)
+    return results[:TOP_N_REPORT]
+
+
+def _format_ob_lines(ob: dict, price: float) -> list:
+    """오더블록 정보를 리포트 라인으로 변환"""
+    lines = []
+    has_ob = ob.get('bull') or ob.get('bear') or ob.get('flipped_bear')
+    if not has_ob:
+        return lines
+
+    lines.append('       오더블록:')
+
+    # ① OB 플립 (전 저항 → 현재 지지) — 가장 먼저 표시
+    flipped = sorted(ob.get('flipped_bear', []),
+                     key=lambda x: abs(price - x['High']))
+    for b in flipped[:2]:
+        dist_pct = (price - b['High']) / b['High'] * 100
+        date_str = b['Date'].strftime('%Y-%m-%d') if hasattr(b['Date'], 'strftime') else str(b['Date'])[:10]
+        visit_str = f'접촉{b["visit_count"]}회' if b.get('visit_count', 0) > 0 else '미접촉'
+        if dist_pct <= 2:
+            proximity = f'  ← 플립지지 진입! (+{dist_pct:.1f}%)'
+        elif dist_pct <= 5:
+            proximity = f'  ← 플립지지 근접 (+{dist_pct:.1f}%)'
+        else:
+            proximity = f'  (돌파 +{dist_pct:.1f}%)'
+        lines.append(
+            f'         🔄 OB플립: {b["Low"]:>10,.0f} ~ {b["High"]:,.0f}원'
+            f'  ({date_str}, {visit_str}){proximity}'
+        )
+
+    # ② 강세 오더블록 (현재가에 가까운 순 3개)
+    bull_obs = sorted(ob.get('bull', []),
+                      key=lambda x: abs(price - x['Mid']))
+    for b in bull_obs[:3]:
+        dist_pct = (price - b['High']) / b['High'] * 100
+        date_str = b['Date'].strftime('%Y-%m-%d') if hasattr(b['Date'], 'strftime') else str(b['Date'])[:10]
+        fresh_str = '미접촉' if b.get('is_fresh') else f'접촉{b.get("visit_count",0)}회'
+        strong_str = ' ★고거래량' if b.get('is_strong') else ''
+        if dist_pct == 0 or abs(dist_pct) <= 1:
+            proximity = '  ← 진입 중!'
+        elif dist_pct <= 4:
+            proximity = f'  ← {dist_pct:+.1f}% (근접)'
+        else:
+            proximity = f'  ({dist_pct:+.1f}%)'
+        lines.append(
+            f'         ✅ 강세OB: {b["Low"]:>10,.0f} ~ {b["High"]:,.0f}원'
+            f'  ({date_str}, {fresh_str}{strong_str}){proximity}'
+        )
+
+    # ③ 활성 약세 오더블록 (아직 저항인 것, 2개)
+    bear_obs = sorted(ob.get('bear', []),
+                      key=lambda x: abs(price - x['Mid']))
+    for b in bear_obs[:2]:
+        dist_pct = (b['Low'] - price) / price * 100
+        date_str = b['Date'].strftime('%Y-%m-%d') if hasattr(b['Date'], 'strftime') else str(b['Date'])[:10]
+        if 0 < dist_pct <= 2:
+            proximity = f'  ← 저항 근접! (+{dist_pct:.1f}%)'
+        elif 0 < dist_pct <= 5:
+            proximity = f'  ← {dist_pct:+.1f}% 위 (저항)'
+        else:
+            proximity = f'  ({dist_pct:+.1f}%)'
+        lines.append(
+            f'         ⚠  약세OB: {b["Low"]:>10,.0f} ~ {b["High"]:,.0f}원'
+            f'  ({date_str}){proximity}'
+        )
+
+    return lines
+
+
+def build_report(results: list, scan_market: str) -> str:
+    now = datetime.now()
+    lines = []
+    sep  = '═' * 70
+    sep2 = '─' * 70
+
+    mkt_ctx = getattr(run_scan, '_market_ctx', {})
+
+    lines.append(sep)
+    lines.append(f'  일일 세력 분석 리포트')
+    lines.append(f'  {now.strftime("%Y년 %m월 %d일 %H:%M")}  |  시장: {scan_market}')
+    lines.append(sep)
+    lines.append(f'  세력 흔적 발견 종목: {len(results)}개')
+    if mkt_ctx.get('desc'):
+        lines.append(f'  {mkt_ctx["desc"]}')
+    lines.append('')
+    lines.append('  ─ 점수 구성 (합계 100점) ───────────────────────────────────────')
+    lines.append('  세력흔적 25% + 급등임박 30% + 외국인/기관 수급 25% + 차트패턴 20%')
+    lines.append('  70점↑ 매수 적극 검토  |  55점↑ 매수 검토  |  40점↑ 관망')
+    lines.append(f'  ML예측: {model_stats()}')
+    lines.append('')
+
+    # ── 엘리트 픽 섹션 (백테스트 검증 기준, 최우선 주목) ──────────────────────
+    consec_map = getattr(run_scan, '_consec_map', {})
+    elite_picks = _get_elite_picks(results, consec_map)
+
+    lines.append(sep)
+    if elite_picks:
+        lines.append('  ★★★★ 엘리트 픽 — 백테스트 검증 최고 신뢰 조건 충족 종목')
+        lines.append('  ┌ Tier1: 세력≥90+급등≥65   ┬ Tier2: 세력≥80+거래량>3x')
+        lines.append('  ├ Tier3: 세력≥75+연속3일+   ┼ Tier4: 급등≥80+연속2일+')
+        lines.append('  └ Tier5: 쇼트스퀴즈+세력≥70 ┘')
+        lines.append(sep2)
+        lines.append(
+            f'  {"종목명":<14} {"코드":<8} {"현재가":>9} {"합산":>5}'
+            f' {"세력":>5} {"급등":>5} {"거래량":>6} {"연속":>4}  조건 | 주요 신호'
+        )
+        lines.append(sep2)
+        for r in elite_picks:
+            vr     = r.get('vol_ratio', 0)
+            consec = r.get('consec_days', 0)
+            cond   = ' + '.join(r['elite_reasons'])
+            sig    = next(
+                (t for t in r.get('surge_tags', []) + r.get('s_tags', [])
+                 if '연속등장' not in t and 'Tier' not in t and '보너스' not in t), ''
+            )
+            consec_str = f'{consec}일' if consec > 0 else ' - '
+            lines.append(
+                f'  {r["name"]:<14} {r["ticker"]:<8} {r["price"]:>9,.0f}원'
+                f' {r["combined"]:>5}점'
+                f' {r["seoryeok"]:>5}점'
+                f' {r["surge"]:>5}점'
+                f' {vr:>5.1f}x'
+                f' {consec_str:>4}'
+                f'  {cond}  |  {sig}'
+            )
+        lines.append(sep2)
+        lines.append(f'  ※ 엘리트픽 {len(elite_picks)}종목  '
+                     '| 즉시 모니터링 — 1~3거래일 내 급등 가능성 최우선 추적')
+    else:
+        lines.append('  ★★★★ 엘리트 픽: 해당 없음 (4개 조건 모두 미충족)')
+        lines.append(sep2)
+    lines.append('')
+
+    # ── 슈퍼픽 섹션 (백테스트 기반 최고 신뢰 종목) ────────────────────────
+    # 잠복형: vol < 0.3x + surge ≥ 65 + combined ≥ 60  (극도 압축 후 폭발 대기)
+    # 폭발형: vol > 3.0x + seoryeok ≥ 60 + combined ≥ 58  (세력 확인 진입)
+    latent_picks    = [r for r in results
+                       if r.get('vol_ratio', 0) < 0.3
+                       and r.get('surge', 0) >= 65
+                       and r.get('combined', 0) >= 60]
+    explosive_picks = [r for r in results
+                       if r.get('vol_ratio', 0) > 3.0
+                       and r.get('seoryeok', 0) >= 60
+                       and r.get('combined', 0) >= 58]
+    seen = set()
+    super_picks = []
+    for r in sorted(latent_picks + explosive_picks, key=lambda x: x['combined'], reverse=True):
+        if r['ticker'] not in seen:
+            seen.add(r['ticker'])
+            super_picks.append(r)
+
+    lines.append(sep)
+    if super_picks:
+        lines.append('  ★★★ 슈퍼픽 — 백테스트 최고 신뢰 종목 (즉시 모니터링 대상)')
+        lines.append('      잠복형(vol<0.5x + 급등≥55) 또는 폭발형(vol>3x + 세력≥50)')
+        lines.append(sep2)
+        lines.append(
+            f'  {"종목명":<14} {"코드":<8} {"현재가":>9} {"합산":>5}'
+            f' {"세력":>5} {"급등":>5} {"거래량":>6}  유형  주요 신호'
+        )
+        lines.append(sep2)
+        for r in super_picks:
+            vr = r.get('vol_ratio', 0)
+            pick_type = '잠복형' if vr < 0.5 else '폭발형'
+            sig = next((t for t in r.get('surge_tags', []) + r.get('s_tags', [])
+                        if '연속등장' not in t), '')
+            lines.append(
+                f'  {r["name"]:<14} {r["ticker"]:<8} {r["price"]:>9,.0f}원'
+                f' {r["combined"]:>5}점'
+                f' {r["seoryeok"]:>5}점'
+                f' {r["surge"]:>5}점'
+                f' {vr:>5.1f}x'
+                f'  {pick_type}  {sig}'
+            )
+        lines.append(sep2)
+        lines.append(
+            f'  ※ 슈퍼픽 {len(super_picks)}종목: 잠복형 {len(latent_picks)}개, 폭발형 {len(explosive_picks)}개'
+        )
+    else:
+        lines.append('  ★★★ 슈퍼픽: 해당 없음 (잠복형 또는 폭발형 조건 미충족)')
+        lines.append(sep2)
+    lines.append('')
+
+    # ── 급등 임박 후보 섹션 ────────────────────────────────────────────────
+    imminent = [r for r in results if r.get('accum_info', {}).get('is_fresh_refire')]
+    if imminent:
+        lines.append(sep)
+        lines.append('  ★★ 급등 임박 후보 — 재발화 20일 이내 종목 (2~4주 내 급등 가능성 높음)')
+        lines.append('     조건: 과거 60일↑ 매집 이력 3회+ → 침묵 → 최근 10일 내 재출현')
+        lines.append(sep2)
+        lines.append(
+            f'  {"종목명":<14} {"코드":<8} {"현재가":>9} {"합산":>5}'
+            f' {"재발화":>6} {"이력":>4} {"시총":>8} {"PBR":>5}  주요 신호'
+        )
+        lines.append(sep2)
+        for r in imminent:
+            ai  = r.get('accum_info', {})
+            fin = r.get('fin', {})
+            dsr = ai.get('days_since_refire', 0)
+            hc  = ai.get('hist_count', 0)
+            sig = next((t for t in r['s_tags'] if '재발화' not in t and '이력' not in t), '')
+            cap_str = fmt_market_cap(fin.get('market_cap'))
+            pbr_str = f'{fin["pbr"]:.2f}' if fin.get('pbr') else '  -'
+            lines.append(
+                f'  {r["name"]:<14} {r["ticker"]:<8} {r["price"]:>9,.0f}원'
+                f' {r["combined"]:>5}점'
+                f' {dsr:>4}일전'
+                f' {hc:>4}회'
+                f' {cap_str:>8}'
+                f' {pbr_str:>5}  {sig}'
+            )
+        lines.append(sep2)
+        lines.append(
+            '  ※ 매집경과 ★★=신선재발화(20일↓) ★=재발화 | 재발화 후 평균 14일 내 급등 관찰됨'
+        )
+        lines.append('')
+    else:
+        lines.append(sep2)
+        lines.append('  ★★ 급등 임박 후보: 해당 없음 (재발화 20일 이내 종목 없음)')
+        lines.append(sep2)
+        lines.append('')
+
+    # 전체 순위 테이블 (100개)
+    lines.append(sep2)
+    lines.append(
+        f'  {"순위":<4} {"종목명":<14} {"코드":<8}'
+        f' {"현재가":>9} {"합산":>5} {"세력":>5} {"급등":>5} {"수급":>5} {"패턴":>5}'
+        f' {"거래량":>6} {"vsMA20":>7} {"매집경과":>7} {"시총":>8}'
+    )
+    lines.append(sep2)
+
+    for rank, r in enumerate(results, 1):
+        inv = r.get('investor', 0)
+        pat = r.get('pattern', 0)
+        ai  = r.get('accum_info', {})
+        ds  = ai.get('days_since')
+        fin = r.get('fin', {})
+        pvm = r.get('price_vs_ma20')
+        if ai.get('is_fresh_refire'):
+            marker = '★★'
+        elif ai.get('is_reactivating'):
+            marker = '★ '
+        else:
+            marker = '  '
+        accum_str = f'{marker}{ds}일' if ds is not None else '     -'
+        cap_str   = fmt_market_cap(fin.get('market_cap'))
+        if pvm is not None:
+            ma20_str = f'{pvm:+.1f}%'
+            ma20_flag = ' ✅' if pvm >= 0 else (' ⚡' if pvm >= -5 else ' ❌')
+        else:
+            ma20_str  = '   nan'
+            ma20_flag = ''
+        lines.append(
+            f'  {rank:<4} {r["name"]:<14} {r["ticker"]:<8}'
+            f' {r["price"]:>9,.0f}원'
+            f' {r["combined"]:>5}점'
+            f' {r["seoryeok"]:>5}점'
+            f' {r["surge"]:>5}점'
+            f' {inv:>5}점'
+            f' {pat:>5}점'
+            f' {r["vol_ratio"]:>5.1f}x'
+            f' {ma20_str:>6}{ma20_flag}'
+            f' {accum_str:>7}'
+            f' {cap_str:>8}'
+        )
+
+    lines.append(sep2)
+    lines.append('')
+
+    # 상위 30종목 상세
+    lines.append(sep)
+    lines.append(f'  [ 상위 {TOP_N_DETAIL}종목 상세 분석 ]')
+    lines.append(sep)
+
+    for rank, r in enumerate(results[:TOP_N_DETAIL], 1):
+        inv  = r.get('investor', 0)
+        pat  = r.get('pattern', 0)
+        lines.append(f'\n  {rank:>2}위. {r["name"]} ({r["ticker"]})')
+        lines.append(
+            f'       합산:{r["combined"]:>3}점  세력:{r["seoryeok"]:>3}점  '
+            f'급등:{r["surge"]:>3}점  수급:{inv:>3}점  패턴:{pat:>3}점'
+        )
+        ai = r.get('accum_info', {})
+        ds = ai.get('days_since')
+        accum_str = f'{ds}일 전' if ds is not None else '-'
+        if ai.get('is_fresh_refire'):
+            refire_str = f'  ★★ 급등임박 재발화! ({ai["days_since_refire"]}일 전 재출현)'
+        elif ai.get('is_reactivating'):
+            refire_str = f'  ★ 재발화 ({ai["days_since_refire"]}일 전 재출현)'
+        else:
+            refire_str = ''
+        pvm = r.get('price_vs_ma20')
+        if pvm is not None:
+            ma20_label = f'✅ MA20 위 {pvm:+.1f}%' if pvm >= 0 else \
+                         (f'⚡ MA20 근접 {pvm:+.1f}%' if pvm >= -5 else
+                          f'❌ MA20 아래 {pvm:+.1f}% (진입 주의)')
+        else:
+            ma20_label = 'MA20 데이터 없음'
+        lines.append(
+            f'       현재가: {r["price"]:,.0f}원  |  거래량: {r["vol_ratio"]}x'
+            f'  |  {ma20_label}  |  매집경과: {accum_str}{refire_str}'
+        )
+
+        # 재무지표
+        fin = r.get('fin', {})
+        lines.append(f'       재무:  {fmt_financials(fin)}')
+
+        # 세력 신호
+        s_str = ' | '.join(r['s_tags'][:3])
+        lines.append(f'       세력신호: {s_str}')
+
+        # 급등 신호
+        g_str = ' | '.join(r['surge_tags'][:3])
+        lines.append(f'       급등신호: {g_str}')
+
+        # 수급 신호
+        inv_tags = r.get('inv_tags', [])
+        if inv_tags:
+            i_str = ' | '.join(t for t in inv_tags if not t.startswith('수급데이터'))[:80]
+            if i_str:
+                lines.append(f'       수급신호: {i_str}')
+
+        # 차트 패턴
+        pat_tags = r.get('pat_tags', [])
+        if pat_tags:
+            p_str = ' | '.join(pat_tags[:3])
+            lines.append(f'       패턴신호: {p_str}')
+
+        # 공매도 잔고 (5순위)
+        short = r.get('short', {})
+        if short.get('data_ok'):
+            squeeze_mark = ' ★쇼트스퀴즈!' if short.get('squeeze') else ''
+            lines.append(f'       공매도: {short["signal"]}{squeeze_mark}')
+
+        # RS vs KOSPI
+        rs = r.get('rs_vs_market')
+        if rs is not None:
+            rs_mark = ' ★강세' if rs >= 5 else (' ▲양호' if rs >= 0 else ' ▼약세')
+            lines.append(f'       RS(코스피대비 20일): {rs:+.1f}%{rs_mark}')
+
+        # 오더블록 상세
+        lines.extend(_format_ob_lines(r['ob'], r['price']))
+
+        # ML 신뢰도 티어 + 진입 타이밍
+        ml = r.get('ml_tier', {})
+        if ml:
+            lines.append(f'       ML신뢰도: {ml["label"]}  (예상적중 {ml["hit_rate"]*100:.1f}% / {ml["lift"]:.2f}x lift)')
+            if ml.get('ml_prob') is not None:
+                lines.append(f'               → sklearn보정 확률: {ml["ml_prob"]*100:.1f}%')
+        entry = r.get('entry_timing', '')
+        if entry:
+            lines.append(f'       진입전략: {entry}')
+
+        # 투자 판단
+        c = r['combined']
+        if c >= 70:
+            verdict = '★★★ 매수 적극 검토'
+        elif c >= 55:
+            verdict = '★★  매수 검토'
+        elif c >= 40:
+            verdict = '★   관망 / 모니터링'
+        else:
+            verdict = '    매수 보류'
+        lines.append(f'       판단: {verdict}')
+        lines.append(f'       {sep2}')
+
+    # 점수 적중률 추적 섹션
+    lines.extend(build_tracker_section())
+
+    lines.append('')
+    lines.append(sep)
+    lines.append('  ※ 이 리포트는 참고용입니다. 투자 판단은 본인 책임입니다.')
+    lines.append(sep)
+
+    return '\n'.join(lines)
+
+
+def _build_email_body(now_str: str, results: list, elite_list: list,
+                      imminent: list, mkt_ctx: dict) -> str:
+    sep  = '═' * 60
+    sep2 = '─' * 60
+    L = []
+
+    # ── 헤더 ────────────────────────────────────────────────────
+    L.append(sep)
+    L.append(f'  세력 분석 리포트  |  {now_str}')
+    L.append(f'  총 후보: {len(results)}종목  |  {mkt_ctx.get("desc", "")}')
+    L.append(sep)
+
+    # ── 엘리트 픽 ───────────────────────────────────────────────
+    L.append('')
+    L.append('★★★★ 엘리트 픽 (백테스트 최고 신뢰 — 즉시 모니터링)')
+    L.append(sep2)
+    if elite_list:
+        for r in elite_list:
+            ml   = r.get('ml_tier', {})
+            tier = ml.get('tier', '?')
+            rate = ml.get('hit_rate', 0)
+            cond = ' / '.join(r['elite_reasons'])
+            entry = r.get('entry_timing', '')
+            rs   = r.get('rs_vs_market')
+            rs_str = f'  RS코스피대비 {rs:+.1f}%' if rs is not None else ''
+            pvm = r.get('price_vs_ma20')
+            if pvm is not None:
+                ma20_str = f'  ✅MA20위{pvm:+.1f}%' if pvm >= 0 else \
+                           (f'  ⚡MA20근접{pvm:+.1f}%' if pvm >= -5 else
+                            f'  ❌MA20아래{pvm:+.1f}%(주의)')
+            else:
+                ma20_str = ''
+            L.append(
+                f"  {r['name']} ({r['ticker']})  {r['price']:,.0f}원"
+                f"  합산{r['combined']}점 세력{r['seoryeok']}점 급등{r['surge']}점"
+                f"  거래량{r.get('vol_ratio',0):.1f}x  연속{r.get('consec_days',0)}일{ma20_str}"
+            )
+            L.append(f"    조건: {cond}")
+            L.append(f"    ML: Tier-{tier} / 예상적중 {rate*100:.1f}%{rs_str}")
+            L.append(f"    진입전략: {entry}")
+            L.append('')
+    else:
+        L.append('  해당 없음')
+    L.append(sep2)
+
+    # ── 급등 임박 후보 ───────────────────────────────────────────
+    L.append('')
+    L.append('★★ 급등 임박 후보 (매집 재발화 — 2~4주 내 급등 가능성)')
+    L.append(sep2)
+    if imminent:
+        for r in imminent:
+            ai  = r.get('accum_info', {})
+            dsr = ai.get('days_since_refire', 0)
+            hc  = ai.get('hist_count', 0)
+            ml  = r.get('ml_tier', {})
+            tier = ml.get('tier', '?')
+            rate = ml.get('hit_rate', 0)
+            rs   = r.get('rs_vs_market')
+            rs_str = f'  RS {rs:+.1f}%' if rs is not None else ''
+            entry = r.get('entry_timing', '')
+            L.append(
+                f"  {r['name']} ({r['ticker']})  {r['price']:,.0f}원"
+                f"  합산{r['combined']}점 세력{r['seoryeok']}점"
+                f"  재발화{dsr}일전 / 이력{hc}회{rs_str}"
+            )
+            L.append(f"    ML: Tier-{tier} / 예상적중 {rate*100:.1f}%")
+            L.append(f"    진입전략: {entry}")
+            L.append('')
+    else:
+        L.append('  해당 없음')
+    L.append(sep2)
+
+    # ── 전체 순위 TOP 10 ─────────────────────────────────────────
+    L.append('')
+    L.append('전체 순위 TOP 10')
+    L.append(sep2)
+    for i, r in enumerate(results[:10], 1):
+        ml   = r.get('ml_tier', {})
+        tier = ml.get('tier', '?')
+        rate = ml.get('hit_rate', 0)
+        rs   = r.get('rs_vs_market')
+        rs_str = f'  RS {rs:+.1f}%' if rs is not None else ''
+        L.append(
+            f"  {i:>2}. {r['name']} ({r['ticker']})"
+            f"  {r['price']:,.0f}원  합산{r['combined']}점"
+            f"  세력{r['seoryeok']} 급등{r['surge']} 거래량{r.get('vol_ratio',0):.1f}x"
+            f"  Tier-{tier}({rate*100:.0f}%){rs_str}"
+        )
+    L.append(sep2)
+
+    # ── 수익화 전략 ──────────────────────────────────────────────
+    k5 = mkt_ctx.get('kospi_5d', 0)
+    q5 = mkt_ctx.get('kosdaq_5d', 0)
+    market_bull = k5 > 2.0 and q5 > 2.0
+    market_bear = k5 < -3.0 and q5 < -3.0
+
+    L.append('')
+    L.append(sep)
+    L.append('  ★ 오늘의 수익화 전략')
+    L.append(sep)
+
+    # 시장 환경 판단
+    if market_bull:
+        mkt_stance = f'강세장 (코스피 {k5:+.1f}%) — 공격적 진입 가능, 개별 신호 신뢰도 ↑'
+    elif market_bear:
+        mkt_stance = f'하락장 (코스피 {k5:+.1f}%) — 보수적 대응, 포지션 축소 권고'
+    else:
+        mkt_stance = f'중립장 (코스피 {k5:+.1f}%) — 신호 강도 높은 종목 선별적 진입'
+
+    L += [
+        f'  시장 환경: {mkt_stance}',
+        '',
+        '  ┌─ 진입 원칙 (ML 티어별) ─────────────────────────────────────',
+        '  │',
+        '  │  Tier-S (세력80+)  예상적중 ~18~25%',
+        '  │    → 당일 또는 익일 거래량 1.5x+ 확인 후 진입',
+        '  │    → 포지션 비중: 2~3%  목표: +10~15%  손절: -5%',
+        '  │',
+        '  │  Tier-A (세력70+)  예상적중 ~12%',
+        '  │    → 거래량 2x+ 또는 SE_Entry 신호 발생 시 진입',
+        '  │    → 포지션 비중: 1~2%  목표: +10%  손절: -5%',
+        '  │',
+        '  │  Tier-B/C          예상적중 ~6~8%',
+        '  │    → 추가 신호(SE_Entry + 거래량 2x+) 동시 확인 필수',
+        '  │    → 포지션 비중: 0.5~1%  관망 우선',
+        '  │',
+        '  └──────────────────────────────────────────────────────────────',
+        '',
+        '  ┌─ 매매 체크리스트 ────────────────────────────────────────────',
+        '  │  진입 전 확인사항:',
+        '  │  □ 세력 점수 70점 이상인가?',
+        '  │  □ 당일 거래량이 30일 평균의 1.5배 이상인가?',
+        '  │  □ 코스피 대비 RS 양수(상대 강세)인가?',
+        '  │  □ MA 정배열(20>60>120) 상태인가?',
+        '  │  □ 연속 등장 2일 이상인가?',
+        '  │',
+        '  │  리스크 관리:',
+        '  │  □ 동시 보유 최대 3종목 (총 노출 6% 이내)',
+        '  │  □ 손절선 매수가 -5% 엄수',
+        '  │  □ 급등 후 고점 대비 -7% 하락 시 익절 고려',
+        '  │  □ 하락장(코스피 -3%↓) 신규 진입 자제',
+        '  └──────────────────────────────────────────────────────────────',
+        '',
+        '  ┌─ 오늘 최우선 관심 종목 ─────────────────────────────────────',
+    ]
+
+    # Tier-S 또는 Tier-A 중 최상위 3개 추천
+    top_picks = sorted(
+        [r for r in results if r.get('ml_tier', {}).get('tier') in ('S', 'A')],
+        key=lambda x: (x.get('ml_tier', {}).get('hit_rate', 0), x['combined']),
+        reverse=True
+    )[:3]
+
+    if not top_picks:
+        top_picks = results[:3]
+
+    for i, r in enumerate(top_picks, 1):
+        ml    = r.get('ml_tier', {})
+        tier  = ml.get('tier', '?')
+        rate  = ml.get('hit_rate', 0)
+        entry = r.get('entry_timing', '')
+        rs    = r.get('rs_vs_market')
+        rs_str = f'  RS {rs:+.1f}%' if rs is not None else ''
+        L.append(
+            f'  │  {i}. {r["name"]} ({r["ticker"]})  {r["price"]:,.0f}원'
+            f'  Tier-{tier} 예상{rate*100:.0f}%  세력{r["seoryeok"]}점{rs_str}'
+        )
+        L.append(f'  │     → {entry}')
+
+    L += [
+        '  └──────────────────────────────────────────────────────────────',
+        '',
+        sep,
+        '  ※ 이 분석은 참고용입니다. 투자 판단은 본인 책임입니다.',
+        '  ※ 세부 내용은 첨부 리포트를 확인하세요.',
+        sep,
+    ]
+
+    return '\n'.join(L)
+
+
+def save_report(report_text: str) -> str:
+    fname = datetime.now().strftime('%Y-%m-%d_%Hh%M_report.txt')
+    fpath = REPORTS_DIR / fname
+    with open(fpath, 'w', encoding='utf-8') as f:
+        f.write(report_text)
+    print(f'\n  리포트 저장: {fpath}')
+    return str(fpath)
+
+
+def mac_notify(title: str, message: str):
+    """macOS 알림 팝업"""
+    try:
+        os.system(
+            f"osascript -e 'display notification \"{message}\" with title \"{title}\"'"
+        )
+    except Exception:
+        pass
+
+
+def main(market: str = 'ALL'):
+    results = run_scan(market)
+
+    if not results:
+        print('\n  세력 흔적 종목 없음.')
+        return
+
+    # 오늘 점수 추적 기록
+    record_scores(results)
+
+    report_text = build_report(results, market)
+    print('\n' + report_text)
+
+    # 파일 저장
+    report_path = save_report(report_text)
+
+    # 이메일 발송
+    now_str    = datetime.now().strftime('%Y-%m-%d %H:%M')
+    consec_map = getattr(run_scan, '_consec_map', {})
+    elite_list = _get_elite_picks(results, consec_map)
+    imminent   = [r for r in results if r.get('accum_info', {}).get('is_fresh_refire')]
+    mkt_ctx    = getattr(run_scan, '_market_ctx', {})
+    elite_str  = f' 엘리트픽 {len(elite_list)}종목!' if elite_list else ''
+    subject    = f'[세력 분석] {now_str} —{elite_str} 급등 후보 {len(results)}종목'
+
+    body = _build_email_body(now_str, results, elite_list, imminent, mkt_ctx)
+    send_report(subject=subject, body=body, attachment_path=report_path)
+
+    # macOS 알림
+    if elite_list:
+        top = elite_list[0]
+        cond = top['elite_reasons'][0]
+        mac_notify(
+            f'★★★★ 엘리트픽 {len(elite_list)}종목 발견!',
+            f'{top["name"]} ({cond}) | 세력{top["seoryeok"]} 급등{top["surge"]}'
+        )
+    else:
+        top1 = results[0]
+        mac_notify(
+            '세력 분석 완료',
+            f'1위: {top1["name"]} {top1["combined"]}점 | 총 {len(results)}종목'
+        )
+
+    print(f'\n  완료. 총 {len(results)}종목 발견.')
+
+
+if __name__ == '__main__':
+    market_arg = sys.argv[1] if len(sys.argv) > 1 else 'ALL'
+    main(market_arg)

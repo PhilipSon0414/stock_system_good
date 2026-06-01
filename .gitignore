@@ -1,0 +1,29 @@
+# ── 민감 정보 (절대 커밋 금지) ──────────────────────────────────────────
+email_config.json          # Gmail 앱 비밀번호 포함
+
+# ── 대용량 데이터 파일 (로컬 전용) ───────────────────────────────────────
+learning_log.json
+learning_log_backup_*.json
+score_history.json
+score_history_backup_*.json
+learned_weights.json
+model_backtest_results.json
+timeframe_results.json
+selection_tracking_results.json
+volume_analysis_results.json
+
+# ── 자동 생성 파일 ────────────────────────────────────────────────────
+reports/
+logs/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pkl
+*.png
+*.DS_Store
+
+# ── 임시/백업 파일 ────────────────────────────────────────────────────
+*.bak
+*.tmp
+*_backup_*
