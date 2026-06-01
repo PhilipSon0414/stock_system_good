@@ -598,7 +598,47 @@ def _fmt_w(key: str) -> str:
         return '?'
 
 
-# ── 5. 진입점 ─────────────────────────────────────────────────────────────────
+# ── 5. GitHub 자동 동기화 ──────────────────────────────────────────────────────
+
+def _git_auto_push():
+    """코드 변경 사항을 GitHub에 자동 커밋 & 푸시."""
+    import subprocess
+
+    repo_dir = Path(__file__).parent
+    try:
+        result = subprocess.run(
+            ['git', 'status', '--porcelain'],
+            cwd=repo_dir, capture_output=True, text=True, timeout=30
+        )
+        changed = [l for l in result.stdout.splitlines()
+                   if l.strip() and not l.endswith('.json') and not l.endswith('.png')]
+        if not changed:
+            return
+
+        subprocess.run(['git', 'add', '*.py', '.gitignore'],
+                       cwd=repo_dir, capture_output=True, timeout=30)
+
+        date_str = datetime.now().strftime('%Y-%m-%d %H:%M')
+        commit = subprocess.run(
+            ['git', 'commit', '-m', f'auto: daily update {date_str}'],
+            cwd=repo_dir, capture_output=True, text=True, timeout=30
+        )
+        if commit.returncode != 0 and 'nothing to commit' in commit.stdout:
+            return
+
+        push = subprocess.run(
+            ['git', 'push', 'origin', 'main'],
+            cwd=repo_dir, capture_output=True, text=True, timeout=60
+        )
+        if push.returncode == 0:
+            print(f'  [GitHub] ✅ push 완료 → PhilipSon0414/stock_system_good')
+        else:
+            print(f'  [GitHub] ⚠ push 실패: {push.stderr.strip()[:80]}')
+    except Exception as e:
+        print(f'  [GitHub] 오류: {e}')
+
+
+# ── 6. 진입점 ─────────────────────────────────────────────────────────────────
 
 def main():
     # sys.argv[1:] 에 YYYYMMDD 날짜를 넘기면 해당일 학습
@@ -621,6 +661,9 @@ def main():
         send_report(subject=subject, body=body)
         print('\n  완료.')
         print()
+
+        # GitHub 자동 동기화 (학습 후 코드 변경 사항 push)
+        _git_auto_push()
 
 
 if __name__ == '__main__':

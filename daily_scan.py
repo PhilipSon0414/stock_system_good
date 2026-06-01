@@ -963,6 +963,51 @@ def mac_notify(title: str, message: str):
         pass
 
 
+def _git_auto_push():
+    """코드 변경 사항을 GitHub에 자동 커밋 & 푸시."""
+    import subprocess
+    from pathlib import Path
+
+    repo_dir = Path(__file__).parent
+
+    try:
+        # 변경된 .py 파일 확인
+        result = subprocess.run(
+            ['git', 'status', '--porcelain'],
+            cwd=repo_dir, capture_output=True, text=True, timeout=30
+        )
+        changed = [l for l in result.stdout.splitlines()
+                   if l.strip() and not l.endswith('.json') and not l.endswith('.png')]
+        if not changed:
+            print('  [GitHub] 변경된 코드 파일 없음 — push 생략')
+            return
+
+        # 변경된 .py 파일만 stage
+        subprocess.run(['git', 'add', '*.py', '.gitignore'],
+                       cwd=repo_dir, capture_output=True, timeout=30)
+
+        date_str = datetime.now().strftime('%Y-%m-%d %H:%M')
+        msg = f'auto: daily scan update {date_str}'
+        commit = subprocess.run(
+            ['git', 'commit', '-m', msg],
+            cwd=repo_dir, capture_output=True, text=True, timeout=30
+        )
+        if commit.returncode != 0 and 'nothing to commit' in commit.stdout:
+            print('  [GitHub] 커밋할 변경 없음')
+            return
+
+        push = subprocess.run(
+            ['git', 'push', 'origin', 'main'],
+            cwd=repo_dir, capture_output=True, text=True, timeout=60
+        )
+        if push.returncode == 0:
+            print(f'  [GitHub] ✅ push 완료 → PhilipSon0414/stock_system_good')
+        else:
+            print(f'  [GitHub] ⚠ push 실패: {push.stderr.strip()[:80]}')
+    except Exception as e:
+        print(f'  [GitHub] 오류 (스캔 결과에는 영향 없음): {e}')
+
+
 def main(market: str = 'ALL'):
     results = run_scan(market)
 
@@ -1007,6 +1052,9 @@ def main(market: str = 'ALL'):
         )
 
     print(f'\n  완료. 총 {len(results)}종목 발견.')
+
+    # ── GitHub 자동 동기화 ────────────────────────────────────────────────
+    _git_auto_push()
 
 
 if __name__ == '__main__':
