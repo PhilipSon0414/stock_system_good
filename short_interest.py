@@ -58,13 +58,26 @@ def get_short_interest(ticker: str) -> dict:
         else:
             trend = 'stable'
 
-        # 쇼트 스퀴즈 가능성: 잔고 비율 1%+ & 감소 추세 (세력이 숏 포지션 청산 유도)
+        # 5일 변화율 (압박 해소 강도)
+        change_rate_5d = None
+        if len(df) >= 5:
+            old_ratio = float(df['ratio_pct'].iloc[-5])
+            if old_ratio > 0:
+                change_rate_5d = round((ratio - old_ratio) / old_ratio * 100, 1)
+
+        # 쇼트 스퀴즈 가능성: 잔고 비율 1%+ & 감소 추세
         squeeze = ratio >= 1.0 and trend == 'decreasing'
 
-        # 신호 태그
+        # 급격한 공매도 압박 해소: 5일 -20%+ 감소 = 쇼트커버 신호
+        rapid_cover = (change_rate_5d is not None and change_rate_5d <= -20.0)
+
         trend_str = {'increasing': '증가↑', 'decreasing': '감소↓', 'stable': '유지→'}.get(trend, '')
-        if squeeze:
-            signal = f'쇼트스퀴즈 가능 (공매도 {ratio:.1f}% {trend_str})'
+        chg_str   = f' ({change_rate_5d:+.0f}%/5일)' if change_rate_5d is not None else ''
+
+        if rapid_cover and ratio >= 1.0:
+            signal = f'★ 공매도 급감 — 쇼트커버 가능 ({ratio:.1f}%{chg_str})'
+        elif squeeze:
+            signal = f'쇼트스퀴즈 가능 (공매도 {ratio:.1f}% {trend_str}{chg_str})'
         elif ratio >= 2.0:
             signal = f'공매도 과다 ({ratio:.1f}% {trend_str})'
         elif ratio >= 1.0:
@@ -73,11 +86,13 @@ def get_short_interest(ticker: str) -> dict:
             signal = f'공매도 낮음 ({ratio:.1f}%)'
 
         return {
-            'ratio':   ratio,
-            'trend':   trend,
-            'squeeze': squeeze,
-            'signal':  signal,
-            'data_ok': True,
+            'ratio':          ratio,
+            'trend':          trend,
+            'squeeze':        squeeze,
+            'rapid_cover':    rapid_cover,
+            'change_rate_5d': change_rate_5d,
+            'signal':         signal,
+            'data_ok':        True,
         }
 
     except Exception:

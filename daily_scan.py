@@ -33,6 +33,10 @@ from forward_tracker import record_scores, build_tracker_section
 from financial_data import get_financials, fmt_financials, fmt_market_cap
 from short_interest import get_short_interest
 from surge_ml import get_confidence_tier, get_entry_timing, model_stats
+from triple_filter import scan_triple_filter
+from ensemble_scan import run_ensemble, build_ensemble_report_section
+from investor_flow import get_investor_flow_stats
+from sector_momentum import get_sector_rs
 
 REPORTS_DIR = Path(__file__).parent / 'reports'
 
@@ -133,6 +137,31 @@ def _get_ticker_score_history(ticker: str, limit: int = 5) -> list[dict]:
                 for r in reversed(hist)]  # 오래된 것 먼저
     except Exception:
         return []
+
+
+def _build_score_history_context(results: list) -> dict:
+    """각 종목의 score_history 기반 co_mean/co_slope/consec 계산."""
+    import numpy as np
+    sh_map = {}
+    for r in results:
+        ticker = r['ticker']
+        hist   = _get_ticker_score_history(ticker, limit=7)
+        if not hist:
+            sh_map[ticker] = {}
+            continue
+        co_vals = [h['combined'] for h in hist]
+        co_mean = float(np.mean(co_vals))
+        if len(co_vals) >= 3:
+            x = np.arange(len(co_vals), dtype=float)
+            co_slope = float(np.polyfit(x, co_vals, 1)[0])
+        else:
+            co_slope = float(co_vals[-1] - co_vals[0]) if len(co_vals) >= 2 else 0.0
+        sh_map[ticker] = {
+            'co_mean':  round(co_mean, 1),
+            'co_slope': round(co_slope, 1),
+            'consec':   len(hist),
+        }
+    return sh_map
 
 
 def _get_consecutive_days() -> dict:
@@ -247,6 +276,13 @@ def analyze_one(ticker: str) -> dict | None:
         fin   = get_financials(ticker)
         short = get_short_interest(ticker)
 
+        # ── 트리플 필터 ─────────────────────────────────────────────────
+        from triple_filter import check_triple
+        triple = check_triple(ticker, df)
+
+        # ── 기관/외국인 흐름 통계 (pykrx) ──────────────────────────────
+        inv_stats = get_investor_flow_stats(ticker)
+
         # ── 현재가 vs MA20 위치 계산 ────────────────────────────────────
         import math as _math
         _ma20 = df['MA20'].iloc[-1] if 'MA20' in df.columns else float('nan')
@@ -257,11 +293,15 @@ def analyze_one(ticker: str) -> dict | None:
 
         # ── RS vs KOSPI (20일 상대 강도) ──────────────────────────────────
         rs_vs_market = None
+        stock_20d_ret = 0.0
         if len(df) >= 20:
             mkt_ctx = getattr(run_scan, '_market_ctx', {})
             kospi_20d = mkt_ctx.get('kospi_20d', 0.0)
-            stock_20d = (close - df['Close'].iloc[-20]) / df['Close'].iloc[-20] * 100
-            rs_vs_market = round(stock_20d - kospi_20d, 1)
+            stock_20d_ret = (close - df['Close'].iloc[-20]) / df['Close'].iloc[-20] * 100
+            rs_vs_market = round(stock_20d_ret - kospi_20d, 1)
+
+        # ── 업종 상대강도 ─────────────────────────────────────────────
+        sector_rs = get_sector_rs(ticker, stock_20d_ret)
 
         # ── ML 신뢰도 티어 ────────────────────────────────────────────────
         latest_row = df.iloc[-1]
@@ -291,10 +331,13 @@ def analyze_one(ticker: str) -> dict | None:
             'accum_info':    accum_info,
             'fin':           fin,
             'short':         short,
-            'rs_vs_market':  rs_vs_market,
-            'ml_tier':       ml_tier,
-            'entry_timing':  entry_timing,
-            'price_vs_ma20': price_vs_ma20,
+            'rs_vs_market':    rs_vs_market,
+            'ml_tier':         ml_tier,
+            'entry_timing':    entry_timing,
+            'price_vs_ma20':   price_vs_ma20,
+            'triple_filter':   triple,
+            '_investor_stats': inv_stats,
+            'sector_rs':       sector_rs,
         }
     except Exception:
         return None
@@ -386,7 +429,19 @@ def run_scan(market: str = 'ALL') -> list:
     run_scan._consec_map = consec_map   # 전달용 임시 저장
 
     results.sort(key=lambda x: x['combined'], reverse=True)
-    return results[:TOP_N_REPORT]
+    results = results[:TOP_N_REPORT]
+
+    # 트리플 필터 + 앙상블 스코어링 실행
+    triple_hits, double_hits = scan_triple_filter(results)
+    if triple_hits:
+        print(f'  트리플 필터 통과: {len(triple_hits)}종목 | 더블: {len(double_hits)}종목')
+
+    sh_map = _build_score_history_context(results)
+    ensemble = run_ensemble(results, mkt_ctx, sh_map)
+    run_scan._ensemble   = ensemble
+    run_scan._triple_hits = triple_hits
+
+    return results
 
 
 def _format_ob_lines(ob: dict, price: float) -> list:
@@ -720,11 +775,19 @@ def build_report(results: list, scan_market: str) -> str:
             squeeze_mark = ' ★쇼트스퀴즈!' if short.get('squeeze') else ''
             lines.append(f'       공매도: {short["signal"]}{squeeze_mark}')
 
-        # RS vs KOSPI
+        # RS vs KOSPI + 업종 RS
         rs = r.get('rs_vs_market')
         if rs is not None:
             rs_mark = ' ★강세' if rs >= 5 else (' ▲양호' if rs >= 0 else ' ▼약세')
             lines.append(f'       RS(코스피대비 20일): {rs:+.1f}%{rs_mark}')
+        sec_rs = r.get('sector_rs', {})
+        if sec_rs.get('signal'):
+            lines.append(f'       업종RS: {sec_rs["signal"]}')
+
+        # 트리플 필터
+        tf = r.get('triple_filter', {})
+        if tf.get('signal'):
+            lines.append(f'       트리플필터: {tf["signal"]}')
 
         # 오더블록 상세
         lines.extend(_format_ob_lines(r['ob'], r['price']))
@@ -751,6 +814,11 @@ def build_report(results: list, scan_market: str) -> str:
             verdict = '    매수 보류'
         lines.append(f'       판단: {verdict}')
         lines.append(f'       {sep2}')
+
+    # 앙상블 스코어링 섹션
+    ensemble = getattr(run_scan, '_ensemble', None)
+    if ensemble:
+        lines.extend(build_ensemble_report_section(ensemble))
 
     # 점수 적중률 추적 섹션
     lines.extend(build_tracker_section())

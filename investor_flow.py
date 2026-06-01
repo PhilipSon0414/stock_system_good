@@ -89,9 +89,71 @@ def _streak(series: pd.Series) -> int:
     return sign * count
 
 
+def get_pykrx_investor_df(ticker: str, days: int = 20) -> pd.DataFrame:
+    """pykrx 기반 기관/외국인 순매매 (네이버 대비 안정적, 더 많은 일수 지원)"""
+    try:
+        from pykrx import stock
+        from datetime import datetime, timedelta
+        end   = datetime.now().strftime('%Y%m%d')
+        start = (datetime.now() - timedelta(days=days * 2)).strftime('%Y%m%d')
+        df = stock.get_market_trading_volume_by_date(start, end, ticker)
+        if df is None or df.empty:
+            return pd.DataFrame()
+        df = df.rename(columns={'기관합계': 'Inst', '외국인합계': 'Foreign'})
+        return df[['Inst', 'Foreign']].tail(days)
+    except Exception:
+        return pd.DataFrame()
+
+
+def get_investor_flow_stats(ticker: str) -> dict:
+    """
+    기관/외국인 수급 통계 (pykrx 기반).
+    Returns:
+        inst_streak     : 기관 연속 순매수 일수 (음수=매도)
+        frgn_streak     : 외국인 연속 순매수 일수
+        inst_transition : 기관 매도→매수 전환 여부
+        frgn_transition : 외국인 매도→매수 전환 여부
+        inst_5d_sum     : 기관 5일 누적 순매수
+        frgn_5d_sum     : 외국인 5일 누적 순매수
+        combo_buy       : 기관+외국인 동시 매수 일수 (최근 5일)
+    """
+    df = get_pykrx_investor_df(ticker, days=20)
+    if df.empty or len(df) < 3:
+        return {}
+
+    inst = df['Inst']
+    frgn = df['Foreign']
+
+    def transition(series):
+        """이전 3일 매도 → 최근 2일 매수 전환 여부"""
+        if len(series) < 5:
+            return False
+        prev   = series.iloc[-5:-2]
+        recent = series.iloc[-2:]
+        return any(v < 0 for v in prev) and all(v > 0 for v in recent)
+
+    combo_buy_days = sum(1 for i, f in zip(inst.tail(5), frgn.tail(5)) if i > 0 and f > 0)
+
+    return {
+        'inst_streak':     _streak(inst),
+        'frgn_streak':     _streak(frgn),
+        'inst_transition': transition(inst),
+        'frgn_transition': transition(frgn),
+        'inst_5d_sum':     int(inst.tail(5).sum()),
+        'frgn_5d_sum':     int(frgn.tail(5).sum()),
+        'combo_buy_days':  combo_buy_days,
+    }
+
+
 def score_investors(ticker: str, ohlcv_df: pd.DataFrame) -> tuple[int, list[str]]:
-    """외국인+기관 수급 점수 (0~100)"""
-    df = get_investor_df(ticker, days=20)
+    """외국인+기관 수급 점수 (0~100) — pykrx 우선, 네이버 폴백"""
+    # pykrx 데이터 우선 시도
+    pykrx_df = get_pykrx_investor_df(ticker, days=20)
+    if not pykrx_df.empty and len(pykrx_df) >= 3:
+        df = pykrx_df
+    else:
+        df = get_investor_df(ticker, days=20)
+
     if df.empty or len(df) < 3:
         return 0, ['수급데이터 없음']
 
@@ -156,11 +218,37 @@ def score_investors(ticker: str, ohlcv_df: pd.DataFrame) -> tuple[int, list[str]
         if price_change_5d < -0.05 and inst_5d > 0:
             pts += 10; tags.append('역발상 기관 매수 (주가하락 중 기관 순매수)')
 
-    # ── 외국인 전환 (매도→매수) ───────────────────────────────────────────
-    if len(frgn) >= 4:
-        prev_trend = frgn.iloc[-4:-1].mean()
-        today_val  = frgn.iloc[-1]
-        if prev_trend < 0 and today_val > 0:
-            pts += 8; tags.append('외국인 순매도→순매수 전환')
+    # ── 전환 신호 (매도→매수) — 가장 강한 진입 신호 ─────────────────────
+    def is_transition(series):
+        if len(series) < 5:
+            return False
+        prev   = series.iloc[-5:-2]
+        recent = series.iloc[-2:]
+        return any(v < 0 for v in prev) and all(v > 0 for v in recent)
+
+    if is_transition(frgn):
+        pts += 15; tags.append('★ 외국인 순매도→순매수 전환 (핵심 신호)')
+    elif len(frgn) >= 4 and frgn.iloc[-4:-1].mean() < 0 and frgn.iloc[-1] > 0:
+        pts += 8;  tags.append('외국인 순매도→순매수 전환')
+
+    if is_transition(inst):
+        pts += 15; tags.append('★ 기관 순매도→순매수 전환 (핵심 신호)')
+
+    # ── 기관+외국인 동시 매수 연속 ────────────────────────────────────────
+    combo_days = sum(1 for i_v, f_v in zip(inst.tail(5), frgn.tail(5)) if i_v > 0 and f_v > 0)
+    if combo_days >= 3:
+        pts += 20; tags.append(f'기관+외국인 동시매수 {combo_days}일 연속')
+    elif combo_days >= 2:
+        pts += 10; tags.append(f'기관+외국인 동시매수 {combo_days}일')
+
+    # ── 누적 순매수 볼륨 ─────────────────────────────────────────────────
+    inst_10d = int(inst.tail(10).sum())
+    frgn_10d = int(frgn.tail(10).sum())
+    if inst_10d > 0 and frgn_10d > 0:
+        tags.append(f'10일 누적: 기관+{inst_10d:,}주 / 외국인+{frgn_10d:,}주')
+    elif inst_10d > 0:
+        tags.append(f'10일 누적 기관 +{inst_10d:,}주')
+    elif frgn_10d > 0:
+        tags.append(f'10일 누적 외국인 +{frgn_10d:,}주')
 
     return max(0, min(100, pts)), tags
