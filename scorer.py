@@ -125,9 +125,15 @@ def score(df: pd.DataFrame, ob_info: dict) -> tuple[int, list[str]]:
         tags.append('상승 시작 신호')
 
     # 눌림목
-    if 'Pullback' in latest.index and latest['Pullback']:
+    # 검증(2026-06): 성공 케이스 7건 중 5건이 이평선정배열+눌림목 조합
+    # → 단독 10점 + 정배열 동시 발생 시 복합 보너스
+    pullback = 'Pullback' in latest.index and latest['Pullback']
+    if pullback:
         pts += 10
         tags.append('눌림목 매수 기회')
+        if latest.get('MaBull', False) and price_above_ma20:
+            pts += 8   # 핵심 복합 패턴: 정배열 + 눌림목
+            tags.append('★ 정배열+눌림목 복합 (성공 패턴)')
 
     # 오더블록 — 거리·품질 세분화 점수
     bull_dist = ob_info.get('nearest_bull_dist')

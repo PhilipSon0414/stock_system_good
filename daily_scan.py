@@ -70,12 +70,15 @@ def get_market_context() -> dict:
 REPORTS_DIR.mkdir(exist_ok=True)
 
 # 스캔 사전 필터 설정
+# 검증 결과 (2026-06): 급등종목 97.9%가 거래량 사전필터에서 탈락
+# → 종목수 1500으로 확대, 최소거래량 20k로 완화
 PRE_FILTER_MIN_PRICE     = 2_000      # 2천원 이상
-PRE_FILTER_MIN_VOLUME    = 50_000     # 5만주 이상
-PRE_FILTER_MAX_STOCKS    = 1_000      # 최대 종목 수 (거래량 상위)
-SEORYEOK_MIN_GATE        = 20         # 세력 흔적 최소 점수 (1차 필터)
-FINAL_MIN_COMBINED       = 35         # 최종 리포트 포함 최소 합산점수 (백테스트: 잡음 감소)
-TOP_N_REPORT             = 50         # 전체 순위 50개 (100→50: 정확도 향상)
+PRE_FILTER_MIN_VOLUME    = 20_000     # 2만주 이상 (50k→20k: 소형주 포착)
+PRE_FILTER_MAX_STOCKS    = 1_500      # 최대 종목 수 (1000→1500: 포착률 향상)
+SEORYEOK_MIN_GATE        = 15         # 세력 흔적 최소 점수 (20→15: 완화)
+FINAL_MIN_COMBINED       = 25         # 최종 리포트 포함 최소 합산점수 (35→25: 완화)
+SEORYEOK_OVERRIDE_GATE   = 60         # 세력 60+ 이면 합산 점수 무시하고 포함
+TOP_N_REPORT             = 50         # 전체 순위 50개
 TOP_N_DETAIL             = 20         # 상세 분석 상위 20개
 
 SCORE_HISTORY_PATH       = Path(__file__).parent / 'score_history.json'
@@ -269,7 +272,8 @@ def analyze_one(ticker: str) -> dict | None:
         pat_pts,   pat_tags   = score_patterns(df)
         combo = combined_score(s_pts, surge_pts, inv_pts, pat_pts)
 
-        if combo < FINAL_MIN_COMBINED:
+        # 세력 60+ 이면 합산 무관 포함 (검증: 세력고점 종목은 저합산도 급등 가능)
+        if s_pts < SEORYEOK_OVERRIDE_GATE and combo < FINAL_MIN_COMBINED:
             return None
 
         vol_ratio = round(df['VolRatio'].iloc[-1], 2) if 'VolRatio' in df.columns else 0
