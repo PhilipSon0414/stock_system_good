@@ -24,7 +24,7 @@ from indicators import add_all
 from seoryeok import analyze
 from order_block import get_order_blocks
 from scorer import score as seoryeok_score, get_accum_info
-from surge_predictor import score_surge, score_surge_with_history, combined_score
+from surge_predictor import score_surge, score_surge_with_history, combined_score, predict_surge_timing
 from investor_flow import score_investors
 from chart_patterns import score_patterns
 from email_sender import send_report
@@ -105,9 +105,11 @@ TOP_N_REPORT             = 50         # 전체 순위 50개
 TOP_N_DETAIL             = 20         # 상세 분석 상위 20개
 
 SCORE_HISTORY_PATH       = Path(__file__).parent / 'score_history.json'
-# 연속 보너스 — 10% 기준 재검증: 합산 70+ 가 오히려 lift 0.52x (연속보너스 허수)
-# → 보너스 최대치 하향 조정 (4일+: 30→20, 3일+: 20→12)
-PERSISTENCE_BONUS_TABLE  = {1: 8, 2: 8, 3: 12, 4: 20}
+# 연속 보너스 역전 (데이터 분석 기반):
+# 연속2일 = 가장 빠른 급등(평균2.4일, 78% 3일내)
+# 연속7일+ = lift 0.00x → 보너스 감소
+# 1일=15, 2일=20, 3일=12, 4일+=8 (신규일수록 강한 신호)
+PERSISTENCE_BONUS_TABLE  = {1: 15, 2: 20, 3: 12, 4: 8}
 
 # 엘리트 픽 기준 — 10% 검증: 세력 80+ 핵심 (1.92x lift)
 # 세력 60-69는 노이즈, 합산 점수보다 세력 점수 우선
@@ -1077,6 +1079,16 @@ def build_report(results: list, scan_market: str) -> str:
         entry = r.get('entry_timing', '')
         if entry:
             lines.append(f'       진입전략: {entry}')
+
+        # 급등 타이밍 예측 (데이터 학습 기반)
+        df_r     = r.get('df')
+        ma_bull  = bool(df_r.iloc[-1].get('MaBull', False)) if df_r is not None and len(df_r) > 0 else False
+        timing   = predict_surge_timing(
+            r['seoryeok'], r.get('vol_ratio', 0) or 0, ma_bull, r.get('consec_days', 0)
+        )
+        lines.append(f'       급등타이밍: {timing["timing_label"]}')
+        lines.append(f'               → 예상 {timing["expected_days"]:.0f}거래일 후  '
+                     f'3일내 확률 {timing["confidence_pct"]}%  |  {timing["holding_advice"]}')
 
         lines.append(f'       {sep2}')
 
