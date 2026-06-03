@@ -347,6 +347,16 @@ def analyze_one(ticker: str) -> dict | None:
             ml_tier['tier'], vol_ratio, rs_vs_market, has_se_entry, consec_days
         )
 
+        # ── 급등 사이클 스테이지 예측 (D-5 ~ D+1) ──────────────────────────
+        stage_result = None
+        try:
+            import sys as _sys
+            _sys.path.insert(0, str(Path(__file__).parent.parent))
+            from surge_stage_model import predict_from_df, stage_tag
+            stage_result = predict_from_df(df)
+        except Exception:
+            pass
+
         return {
             'ticker':        ticker,
             'name':          get_name(ticker),
@@ -374,6 +384,7 @@ def analyze_one(ticker: str) -> dict | None:
             '_investor_stats': inv_stats,
             'sector_rs':       sector_rs,
             'dart_info':       dart_info,
+            'stage':           stage_result,   # 급등 사이클 스테이지
         }
     except Exception:
         return None
@@ -916,7 +927,7 @@ def build_report(results: list, scan_market: str) -> str:
     lines.append(
         f'  {"순위":<4} {"종목명":<14} {"코드":<8}'
         f' {"현재가":>9} {"세력":>4} {"수급":>4} {"거래량":>6}'
-        f' {"vsMA20":>7} {"ML티어":>8} {"급등예상":>9} {"시총":>8}'
+        f' {"vsMA20":>7} {"스테이지":>8} {"ML티어":>8} {"급등예상":>9}'
     )
     lines.append(sep2)
 
@@ -933,19 +944,27 @@ def build_report(results: list, scan_market: str) -> str:
         if ai.get('is_fresh_refire'): rflag = '★★'
         elif ai.get('is_reactivating'): rflag = '★ '
         else: rflag = '  '
-        cap   = fmt_market_cap(fin.get('market_cap'))
         tier  = ml.get('tier','?')
         rate  = ml.get('hit_rate',0)
         ma_s  = f'{pvm:+.1f}%' if pvm is not None else '  nan'
         ma_f  = '✅' if pvm and pvm>=0 else ('⚡' if pvm and pvm>=-5 else '❌')
+        # 스테이지 태그
+        stage_r = r.get('stage')
+        if stage_r:
+            STAGE_ICONS = {'D-1':'🔥','D-2':'⚡','D-3':'📈','D-4':'👀','D-5':'💤','D+0':'🚀','D+1':'📉'}
+            st = stage_r.get('predicted','normal')
+            sp = stage_r.get('confidence', 0)
+            st_s = f'{STAGE_ICONS.get(st,"")}{"" if st=="normal" else st}({sp:.0%})' if st != 'normal' else '  ─  '
+        else:
+            st_s = '  ?  '
         lines.append(
             f'  {rflag}{rank:<3} {r["name"]:<14} {r["ticker"]:<8}'
             f' {r["price"]:>9,.0f}원'
             f' {r["seoryeok"]:>4}점 {inv:>4}점 {vr:>5.1f}x'
             f' {ma_s:>6}{ma_f}'
+            f' {st_s:>8}'
             f' T{tier}({rate*100:.0f}%)'
             f' {t["expected_days"]:.0f}일({t["confidence_pct"]}%)'
-            f' {cap:>8}'
         )
 
     lines.append(sep2)
@@ -977,11 +996,34 @@ def build_report(results: list, scan_market: str) -> str:
         else:
             verdict = '    관망'
 
+        # 스테이지 태그
+        stage_r = r.get('stage')
+        STAGE_ICONS = {'D-1':'🔥','D-2':'⚡','D-3':'📈','D-4':'👀','D-5':'💤','D+0':'🚀','D+1':'📉','normal':''}
+        if stage_r:
+            st = stage_r.get('predicted','normal')
+            sp = stage_r.get('confidence', 0)
+            pre_p = stage_r.get('pre_surge_prob', 0)
+            if st in ('D-1','D-2','D-3'):
+                stage_line = (f'  ┌─ 🎯 급등 사이클 스테이지: {STAGE_ICONS.get(st,"")} {st}'
+                              f'  (신뢰도 {sp:.0%}  사전급등확률 {pre_p:.0%}) ─────────────')
+            elif st in ('D+0','D+1'):
+                stage_line = (f'  ┌─ ⚠  스테이지: {STAGE_ICONS.get(st,"")} {st}'
+                              f'  (이미 발동/후속 {sp:.0%}) — 신규 진입 주의 ──────────────')
+            elif st == 'normal':
+                stage_line = None
+            else:
+                stage_line = (f'  ┌─ 스테이지: {STAGE_ICONS.get(st,"")} {st}'
+                              f'  (신뢰도 {sp:.0%}  사전급등확률 {pre_p:.0%}) ─────────────')
+        else:
+            stage_line = None
+
         lines.append(f'\n  {rank:>2}위. {r["name"]} ({r["ticker"]})  [{verdict}]')
         lines.append(
             f'       세력:{se:>3}점  수급:{inv:>3}점  거래량:{vr:.1f}x'
             f'  ML:{ml.get("label","?")[:20]}'
         )
+        if stage_line:
+            lines.append(stage_line)
         ai = r.get('accum_info', {})
         ds = ai.get('days_since')
         accum_str = f'{ds}일 전' if ds is not None else '-'

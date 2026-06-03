@@ -1,16 +1,16 @@
 """
 급상승 임박 예측 스코어러
 
-세력 매집이 완료되고 곧 급등이 시작될 종목을 탐지.
-높은 점수 = 단기간 내 급등 가능성 높음.
+[2026-06-03 학습 갱신] 국내 2,468건 급등 역추적 분석 결과 반영:
+  ① RangeRel d=+0.335, BoxRange5d d=+0.267 → D-1은 범위 확대 중 (압축→이완 전환)
+  ② VolRatio d=+0.184, VolSlope5 d=+0.156 → 거래량 점진 증가 (1.29x) 신호
+  ③ QuietStreak d=-0.134 → 잠복 기간 자체가 아닌 '잠복 후 회복 전환'이 핵심
+  ④ NR7 d=-0.124 → 한/미 동일: NR7 단독 역방향. VolRecovery 조합 필수
+  ⑤ RSI d=-0.086 → 급등 D-1 RSI=53.6 (중립) — 과매수 아님 신호
+  ⑥ ATRCompress 1.09→1.13 확대 추세 — 변동성 이완 신호 추가
 
-주요 판단 기준 (백테스트 최적화 기준):
-  1. 이평선 배열/가격 위치 — MA(20,60,120) 정배열 + MA120 위 (1.54x lift)
-  2. 거래량 압축   — 세력이 물량 모은 후 아무것도 안 하는 구간
-  3. 횡보 기간     — 길게 눌릴수록 반등 폭이 큼
-  4. 골든크로스 임박 — MA20/MA60 크로스 (2.15x lift, 기존 MA5/MA20: 0.62x)
-  5. 지지 반복 테스트 — 같은 가격대를 여러 번 지지받은 경우
-  6. 강세 오더블록 근접 — 세력 매수 구간에 가격이 돌아옴
+기존 '압축→폭발 전환' 로직 방향 유효 확인 (2x+/5일+ 잠복 후 폭발 = 핵심).
+단, 순수 잠복 일수 점수 하향, 중간 거래량 회복(1.0~2.0x) 구간 신설.
 """
 
 import pandas as pd
@@ -47,8 +47,12 @@ def score_surge(df: pd.DataFrame, ob_info: dict) -> tuple[int, list[str]]:
             pts += 12; tags.append('MA 단기 정배열 (20>60)')
 
     # ── 2. 거래량 분석 (최대 20점) ──────────────────────────────────────
-    # 백테스트: D-1 ≥2x → Lift 17.03x / ≥3x → 10.36x / 0.5~0.7x → lift<1.0x(역신호)
-    vol_r = latest.get('VolRatio', np.nan)
+    # [학습 갱신] D-1 급등군 VolRatio=1.29 vs 대조군 1.06 (d=+0.184)
+    # 폭증뿐 아니라 1.0~2.0x 중간 활성 구간도 유의미한 신호로 확인
+    vol_r     = latest.get('VolRatio',   np.nan)
+    vol_slope = latest.get('VolSlope5',  np.nan)  # [신규] 5일 거래량 기울기
+    vol_rec   = bool(latest.get('VolRecovery', False))  # [신규] 잠복→회복 전환
+
     if not pd.isna(vol_r):
         if vol_r >= 5.0:
             pts += 20; tags.append('거래량 폭증 (5x+) — 세력 진입')
@@ -56,17 +60,24 @@ def score_surge(df: pd.DataFrame, ob_info: dict) -> tuple[int, list[str]]:
             pts += 16; tags.append('거래량 폭증 (3x+)')
         elif vol_r >= 2.0:
             pts += 12; tags.append('거래량 상승 (2x+) — 돌파 신호')
+        elif vol_r >= 1.2:
+            pts += 7;  tags.append(f'거래량 활성 {vol_r:.1f}x — 모멘텀 형성')  # [신규]
         elif vol_r < 0.30:
-            pts += 10; tags.append('거래량 극도 압축 (<30%) — 세력 잠복')
+            # [학습 갱신] 순수 극압축 단독 점수 하향 (10→5점): 잠복 자체보다 전환이 핵심
+            pts += 5;  tags.append('거래량 극압축 (<30%) — 회복 전환 대기')
         elif vol_r < 0.50:
-            pts += 4;  tags.append('거래량 강한 압축 (<50%)')
-        # 0.50~0.70 구간: 백테스트 lift<1.0x → 점수 없음
+            pts += 2;  tags.append('거래량 압축 (<50%)')
+        # 0.50~0.70 구간: lift<1.0x → 점수 없음
+
+    # [신규] VolSlope5: 5일 거래량 증가 추세 (학습 d=+0.156)
+    if not pd.isna(vol_slope) and vol_slope > 0 and not pd.isna(vol_r) and vol_r < 2.0:
+        pts += 5; tags.append('거래량 5일 증가 추세 (VolSlope↑)')
 
     # ── 2b. 잠복 일수 + 압축→폭발 전환 감지 (최대 35점) ────────────────────
-    # 전환 패턴 = 과거 연속 저거래량 + 현재 거래량 상승 시작
+    # [학습 확인] '압축→폭발 전환(VolRecovery)' 방향 유효. 순수 잠복 점수 하향.
+    # QuietStreak d=-0.134: 잠복 중 상태 자체보다 잠복이 끝나는 시점이 핵심.
     if 'VolRatio' in df.columns and len(df) >= 3:
-        vol_vals = df['VolRatio'].dropna().values
-        # 오늘(latest) 제외하고 직전부터 거슬러 연속 저거래량 일수
+        vol_vals  = df['VolRatio'].dropna().values
         prev_vals = vol_vals[:-1] if len(vol_vals) > 1 else vol_vals
         quiet_streak = 0
         for v in reversed(prev_vals):
@@ -79,12 +90,20 @@ def score_surge(df: pd.DataFrame, ob_info: dict) -> tuple[int, list[str]]:
             pts += 35; tags.append(f'★ 압축→폭발 전환 ({quiet_streak}일 잠복 후 2x+ 상승)')
         elif not pd.isna(vol_r) and vol_r >= 1.5 and quiet_streak >= 3:
             pts += 22; tags.append(f'압축→폭발 조짐 ({quiet_streak}일 잠복 후 1.5x+ 상승)')
+        elif not pd.isna(vol_r) and vol_r >= 1.2 and quiet_streak >= 3:
+            # [신규] 중간 회복형: 잠복 후 1.2x+ 상승도 유효 신호로 추가
+            pts += 15; tags.append(f'잠복 후 거래량 회복 ({quiet_streak}일→{vol_r:.1f}x)')
         elif quiet_streak >= 7:
-            pts += 18; tags.append(f'세력 잠복 {quiet_streak}일 연속 저거래량')
+            # [학습 갱신] 순수 잠복 7일 → 18점에서 10점으로 하향
+            pts += 10; tags.append(f'세력 잠복 {quiet_streak}일 (회복 대기)')
         elif quiet_streak >= 5:
-            pts += 10; tags.append(f'연속 저거래량 {quiet_streak}일')
+            pts += 6;  tags.append(f'연속 저거래량 {quiet_streak}일')
         elif quiet_streak >= 3:
-            pts += 5;  tags.append(f'연속 저거래량 {quiet_streak}일')
+            pts += 3;  tags.append(f'연속 저거래량 {quiet_streak}일')
+
+    # [신규] VolRecovery 복합 신호 (indicators.py 계산값 활용)
+    if vol_rec:
+        pts += 8; tags.append('★ 거래량 잠복→회복 전환 (VolRecovery)')
 
     # ── 3. 횡보 기간 및 박스권 압축 (최대 20점) ───────────────────────────
     for days, label, score in [(20, '20일', 20), (15, '15일', 14), (10, '10일', 8)]:
@@ -144,15 +163,37 @@ def score_surge(df: pd.DataFrame, ob_info: dict) -> tuple[int, list[str]]:
     if flip_dist is not None and flip_dist < 0.04:
         pts += 10; tags.append(f'OB 플립 지지 ({flip_dist*100:.1f}%)')
 
-    # ── 7. NR7 / VCP 변동성 압축 (최대 15점) ────────────────────────────
+    # ── 7. NR7 / VCP 변동성 압축 ──────────────────────────────────────────
+    # [학습 갱신] NR7 d=-0.124 (역방향): 단독 점수 하향, VolRecovery 조합 시 완전 점수
     if latest.get('VCP', False):
         pts += 15; tags.append('VCP 변동성 수축 — 폭발 직전')
     elif latest.get('NR7', False):
-        pts += 10; tags.append('NR7 가격 압축 (7일 최소 범위)')
+        if vol_rec or (not pd.isna(vol_slope) and vol_slope > 0):
+            pts += 12; tags.append('NR7 + 거래량 회복 복합 — 폭발 임박')
+        else:
+            pts += 5;  tags.append('NR7 가격 압축 (거래량 회복 대기)')
 
     # ── 8. OBV 다이버전스 (최대 15점) ────────────────────────────────────
     if latest.get('OBV_Diverge', False):
         pts += 15; tags.append('OBV 다이버전스 — 세력 매집 중')
+
+    # ── 8b. ATR 모멘텀 [신규] ─────────────────────────────────────────────
+    # 학습: ATRCompress D-5→D-1 = 1.091→1.125 (점진 확대 = 폭발 준비)
+    atr_c = float(latest.get('ATRCompress', np.nan))
+    if not pd.isna(atr_c):
+        if atr_c >= 1.15:
+            pts += 7; tags.append(f'ATR 모멘텀 확대 ({atr_c:.2f}x) — 변동성 이완')
+        elif atr_c >= 1.05:
+            pts += 3; tags.append(f'ATR 소폭 확대 ({atr_c:.2f}x)')
+
+    # ── 8c. RSI 회복 구간 [신규] ─────────────────────────────────────────
+    # 학습: 급등 D-1 RSI=53.6 vs 대조군 55.1 — 과매수 아닌 중립 구간
+    rsi14 = float(latest.get('RSI14', np.nan))
+    if not pd.isna(rsi14):
+        if 30 <= rsi14 <= 57:
+            pts += 5; tags.append(f'RSI {rsi14:.0f} 회복 구간 (30~57) — 과매수 아님')
+        elif rsi14 > 75:
+            pts -= 5; tags.append(f'RSI {rsi14:.0f} 과매수 — 급등 확률 저하')
 
     # ── 9. 52주 신고가 근접 (최대 15점) ──────────────────────────────────
     dist_52w = latest.get('High52W_Dist', np.nan)
