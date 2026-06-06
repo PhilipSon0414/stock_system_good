@@ -1,0 +1,17 @@
+[
+  {
+    "date": "2026-06-05",
+    "event_type": "MAJOR_SELLOFF",
+    "kospi_chg": -5.54,
+    "kosdaq_chg": -4.5,
+    "trigger": "Broadcom AI 가이던스 미스",
+    "circuit_breaker": true,
+    "patterns": [
+      "AI_GUIDANCE_MISS_SELLOFF",
+      "ROTATION_TO_DEFENSIVE",
+      "POST_RALLY_PROFIT_TAKING"
+    ],
+    "learned_at": "2026-06-06T04:07:46.151511",
+    "source": "market_scan_20260605.py"
+  }
+]
