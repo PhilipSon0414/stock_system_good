@@ -11,10 +11,15 @@ import pandas as pd
 from datetime import datetime, timedelta
 
 
-def get_ohlcv(ticker: str, period_days: int = 400) -> pd.DataFrame:
-    start = (datetime.now() - timedelta(days=period_days)).strftime('%Y-%m-%d')
+def get_ohlcv(ticker: str, period_days: int = 400, end_date: str | None = None) -> pd.DataFrame:
+    if end_date:
+        end_dt = datetime.strptime(end_date, '%Y%m%d')
+    else:
+        end_dt = datetime.now()
+    start = (end_dt - timedelta(days=period_days)).strftime('%Y-%m-%d')
+    end_str = end_dt.strftime('%Y-%m-%d')
     try:
-        df = fdr.DataReader(ticker, start)
+        df = fdr.DataReader(ticker, start, end_str)
         if df is None or df.empty:
             return pd.DataFrame()
         df.index = pd.to_datetime(df.index)

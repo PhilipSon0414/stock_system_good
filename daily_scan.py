@@ -105,6 +105,9 @@ TOP_N_REPORT             = 50         # 전체 순위 50개
 TOP_N_DETAIL             = 20         # 상세 분석 상위 20개
 
 SCORE_HISTORY_PATH       = Path(__file__).parent / 'score_history.json'
+
+# 날짜 기준 스캔 (None이면 오늘, 'YYYYMMDD'이면 해당 종가 기준)
+_SCAN_END_DATE: str | None = None
 # 연속 보너스 역전 (데이터 분석 기반):
 # 연속2일 = 가장 빠른 급등(평균2.4일, 78% 3일내)
 # 연속7일+ = lift 0.00x → 보너스 감소
@@ -275,7 +278,7 @@ def _get_elite_picks(results: list, consec_map: dict) -> list:
 def analyze_one(ticker: str) -> dict | None:
     """단일 종목 전체 분석. 실패 시 None 반환."""
     try:
-        df = get_ohlcv(ticker, period_days=400)
+        df = get_ohlcv(ticker, period_days=400, end_date=_SCAN_END_DATE)
         if len(df) < 60:
             return None
 
@@ -1370,7 +1373,9 @@ def _git_auto_push():
         print(f'  [GitHub] 오류 (스캔 결과에는 영향 없음): {e}')
 
 
-def main(market: str = 'ALL'):
+def main(market: str = 'ALL', scan_date: str | None = None):
+    global _SCAN_END_DATE
+    _SCAN_END_DATE = scan_date
     results = run_scan(market)
 
     if not results:
@@ -1413,6 +1418,46 @@ def main(market: str = 'ALL'):
             f'1위: {top1["name"]} {top1["combined"]}점 | 총 {len(results)}종목'
         )
 
+    # ── 스테이지 예측 저장 & 학습 루틴 ──────────────────────────────────────
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).parent.parent))
+        from stage_tracker import save_predictions, daily_routine
+
+        preds = []
+        for r in results:
+            sr = r.get('stage') or {}
+            if not isinstance(sr, dict):
+                sr = {}
+            latest = r['df'].iloc[-1] if r.get('df') is not None else {}
+            preds.append({
+                'ticker':         r['ticker'],
+                'stage':          sr.get('predicted', 'normal'),
+                'confidence':     sr.get('confidence', 0),
+                'pre_surge_prob': sr.get('pre_surge_prob', 0),
+                'price':          r.get('price', 0),
+                'vol_ratio':      r.get('vol_ratio', 0),
+                'rsi14':          float(latest.get('RSI14', 0) or 0),
+                'atr_compress':   float(latest.get('ATRCompress', 1) or 1),
+                'rs_vs_market':   r.get('rs_vs_market', 0) or 0,
+                'price_vs_ma20':  r.get('price_vs_ma20', 0) or 0,
+                'vol_recovery':   bool(latest.get('VolRecovery', False)),
+                'short_ratio':    (r.get('short') or {}).get('ratio', 0),
+                'sector':         '',
+            })
+
+        n_saved = save_predictions(preds, market='KR')
+        print(f'  [학습] 예측 저장: {n_saved}건 (D-1/D-2/D-3)')
+
+        filt = daily_routine(market='KR', verbose=True)
+        if filt and filt.get('n_samples', 0) >= 5:
+            hr = filt.get('overall_hit_rate', 0)
+            n  = filt.get('n_samples', 0)
+            n_pos = len(filt.get('positive_filters', []))
+            print(f'  [학습] 필터 갱신 — 적중률: {hr:.0%} ({n}샘플) 긍정조건: {n_pos}개')
+    except Exception as e:
+        print(f'  [학습] 오류 (무시): {e}')
+
     print(f'\n  완료. 총 {len(results)}종목 발견.')
 
     # ── GitHub 자동 동기화 ────────────────────────────────────────────────
@@ -1421,4 +1466,5 @@ def main(market: str = 'ALL'):
 
 if __name__ == '__main__':
     market_arg = sys.argv[1] if len(sys.argv) > 1 else 'ALL'
-    main(market_arg)
+    date_arg   = sys.argv[2] if len(sys.argv) > 2 else None
+    main(market_arg, scan_date=date_arg)
