@@ -129,7 +129,7 @@ ELITE_CONSEC_TIER4 = 2
 def prefilter_tickers(market: str = 'ALL') -> list:
     """StockListing 기반 사전 필터 — 분석 대상 축소"""
     print('  종목 목록 다운로드 중...')
-    listing = get_ticker_list(market)
+    listing = get_ticker_list(market, date_str=_SCAN_END_DATE)
     if listing.empty:
         print('  ⚠ 종목 목록 없음. 네트워크 확인 요망.')
         return []
