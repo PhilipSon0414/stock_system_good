@@ -97,6 +97,7 @@ def record_scores(results: list, scan_date: str | None = None):
             'name':          r.get('name', r['ticker']),
             'price':         r.get('price', 0),
             'combined':      r.get('combined', 0),
+            'raw_combined':  r.get('raw_combined', r.get('combined', 0)),
             'seoryeok':      r.get('seoryeok', 0),
             'surge':         r.get('surge', 0),
             'investor':      r.get('investor', 0),
@@ -113,6 +114,7 @@ def record_scores(results: list, scan_date: str | None = None):
             'obv_diverge':   _flag('OBV_Diverge'),
             'high52w_dist':  float(latest.get('High52W_Dist', 1.0)) if hasattr(latest, 'get') else 1.0,
             'consec_days':   r.get('consec_days', 0),
+            'sector_rs':     (r.get('sector_rs') or {}).get('rs_score', 0),
             # ── 결과 추적 ─────────────────────────────────────────
             'surged_by_3d':  None,
             'surged_by_5d':  None,

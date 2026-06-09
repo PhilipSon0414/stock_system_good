@@ -263,10 +263,14 @@ def _get_elite_picks(results: list, consec_map: dict) -> list:
             reasons.append(f'Tier3 세력{se}+{consec}일연속')
         if sg >= ELITE_SG_TIER4 and consec >= ELITE_CONSEC_TIER4:
             reasons.append(f'Tier4 급등{sg}+{consec}일연속')
-        # Tier5: 쇼트 스퀴즈 가능성 + 세력 진입 (5순위)
+        # Tier5: 쇼트 스퀴즈 가능성 + 세력 진입
         short = r.get('short', {})
         if short.get('squeeze') and se >= 70:
             reasons.append(f'Tier5 쇼트스퀴즈+세력{se}')
+        # Tier6: 세력70+&수급50+ (섹터 모멘텀 주도 급등 포착)
+        inv = r.get('investor', 0)
+        if se >= 70 and inv >= 50:
+            reasons.append(f'Tier6 세력{se}+수급{inv}')
 
         if reasons and ticker not in seen:
             seen.add(ticker)
@@ -430,6 +434,10 @@ def run_scan(market: str = 'ALL') -> list:
         time.sleep(0.1)
 
     print()
+
+    # raw_combined 저장 (연속 보너스 적용 전 순수 점수 — ML 학습 및 역설 분석용)
+    for r in results:
+        r['raw_combined'] = r.get('combined', 0)
 
     # 연속 등장 보너스 적용 (스케일: 1일+10, 2일+10, 3일+20, 4일++30)
     # ※ 이평선 하향 + 현재가 MA20 -10% 이상 이탈 시 보너스 제한 (모델 버그 수정)
@@ -815,9 +823,9 @@ def build_report(results: list, scan_market: str) -> str:
     lines.append(sep)
     if elite_picks:
         lines.append('  ★★★★ 엘리트픽 — 세력점수 최우선 + 급등 타이밍 예측')
-        lines.append('  ┌ Tier1: 세력≥90+거래량 ┬ Tier2: 세력≥80+거래량2x+')
+        lines.append('  ┌ Tier1: 세력≥90+급등 ┬ Tier2: 세력≥80+거래량2x+')
         lines.append('  ├ Tier3: 세력≥75+연속3일 ┼ Tier4: 세력≥70+연속2일')
-        lines.append('  └ Tier5: 쇼트스퀴즈+세력≥70 ┘')
+        lines.append('  ├ Tier5: 쇼트스퀴즈+세력≥70 ┼ Tier6: 세력≥70+수급≥50 ┘')
         lines.append(sep2)
         lines.append(
             f'  {"종목명":<14} {"현재가":>9} {"세력":>4} {"수급":>4} {"거래량":>6}'
