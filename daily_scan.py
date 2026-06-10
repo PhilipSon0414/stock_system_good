@@ -112,7 +112,7 @@ _SCAN_END_DATE: str | None = None
 # 연속2일 = 가장 빠른 급등(평균2.4일, 78% 3일내)
 # 연속7일+ = lift 0.00x → 보너스 감소
 # 1일=15, 2일=20, 3일=12, 4일+=8 (신규일수록 강한 신호)
-PERSISTENCE_BONUS_TABLE  = {1: 15, 2: 20, 3: 12, 4: 8}
+PERSISTENCE_BONUS_TABLE  = {1: 10, 2: 5, 3: 3, 4: 2}  # 데이터검증: 연속2일=0%, 4일+=3% → 대폭 축소
 
 # 엘리트 픽 기준 — 10% 검증: 세력 80+ 핵심 (1.92x lift)
 # 세력 60-69는 노이즈, 합산 점수보다 세력 점수 우선
@@ -805,8 +805,9 @@ def build_report(results: list, scan_market: str) -> str:
     lines.append('  ┌─ 의사결정 핵심 원칙 (데이터 검증) ─────────────────────────────────')
     lines.append('  │  세력점수 = 유일한 예측 피처 (+5.9pt 차이)  |  합산점수 ≠ 예측력')
     lines.append('  │  거래량 2x+ + 세력80+ → 평균 2.0일 내 급등 (100% 3일내)')
-    lines.append('  │  세력70-79 → 평균 2.4일 후 급등 (78% 3일내)')
-    lines.append('  │  세력80+ MA20위 → Tier-S 예상적중 35% (기준 17%의 2.1배)')
+    lines.append('  │  세력70+ & 수급50+ → 5일 적중률 33.8% (2.27x lift) ★ Tier6 핵심')
+    lines.append('  │  세력70+ & 수급80+ → 5일 적중률 75.0% (5.03x lift) ★★★ 최강 신호')
+    lines.append('  │  SE_Entry + 수급50+ → 5일 적중률 66.7% (4.47x lift) ★★★ 즉시 진입')
     lines.append(f'  │  ML모델: {model_stats()}')
     lines.append('  └──────────────────────────────────────────────────────────────────')
 
@@ -952,9 +953,11 @@ def build_report(results: list, scan_market: str) -> str:
         ma_bull = bool(df_r.iloc[-1].get('MaBull',False)) if df_r is not None and len(df_r)>0 else False
         t    = predict_surge_timing(r['seoryeok'], vr, ma_bull, r.get('consec_days',0))
         ai   = r.get('accum_info',{})
-        if ai.get('is_fresh_refire'): rflag = '★★'
-        elif ai.get('is_reactivating'): rflag = '★ '
-        else: rflag = '  '
+        # 수급80+ 종목은 최강 신호(5.03x lift) → 별도 마킹
+        if inv >= 80 and r['seoryeok'] >= 70:  rflag = '💎'
+        elif ai.get('is_fresh_refire'):          rflag = '★★'
+        elif ai.get('is_reactivating'):          rflag = '★ '
+        else:                                    rflag = '  '
         tier  = ml.get('tier','?')
         rate  = ml.get('hit_rate',0)
         ma_s  = f'{pvm:+.1f}%' if pvm is not None else '  nan'

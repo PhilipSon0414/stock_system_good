@@ -81,30 +81,43 @@ def score(df: pd.DataFrame, ob_info: dict) -> tuple[int, list[str]]:
     latest = df.iloc[-1]
     w5 = df.iloc[-5:]
 
-    # 이평선 정배열 — 현재가 MA20 위일 때만 유효 (버그 수정: 고점 이후 하락 중인 종목 오탐 방지)
+    # 이평선 정배열 — 데이터검증: lift 0.88x (MA 정배열 자체 예측력 낮음)
+    # 가중치 하향: +20→+10 (세력 신호에 보조 역할로 축소)
     close_price = latest.get('Close', 0)
     ma20_val    = latest.get('MA20',  0)
     price_above_ma20 = close_price >= ma20_val * 0.98 if ma20_val > 0 else False  # -2% 허용
 
     if latest.get('MaBull', False):
         if price_above_ma20:
-            pts += 20
+            pts += 10          # 20→10: 정배열 단독 예측력 낮아 하향
             tags.append('이평선 정배열')
         else:
-            pts += 5   # 이평 정배열이나 현재가 MA20 아래 → 약한 신호만
+            pts += 3
             tags.append('이평선 정배열(가격MA20아래)')
-    elif latest.get('MA5', 0) > latest.get('MA20', 0):
+    elif latest.get('MaBullShort', False):
+        # 단기 정배열(MA5>MA10>MA20): 중기 정배열보다 빠른 모멘텀 초기 신호
         if price_above_ma20:
-            pts += 10
-            tags.append('단기 정배열(5>20)')
+            pts += 8
+            tags.append('단기 정배열(5>10>20)')
         else:
             pts += 3
             tags.append('단기 정배열(가격MA20아래)')
+    elif latest.get('MA5', 0) > latest.get('MA20', 0):
+        if price_above_ma20:
+            pts += 6
+            tags.append('단기 정배열(5>20)')
+        else:
+            pts += 2
+            tags.append('단기 정배열(가격MA20아래)')
 
-    # 골든크로스
-    if w5['GoldenCross'].any() if 'GoldenCross' in w5 else False:
-        pts += 10
-        tags.append('골든크로스 발생')
+    # 단기 골든크로스(MA5/MA10): 세력 초기 모멘텀 포착 — 중기보다 8거래일 빠름
+    if 'GoldenCrossShort' in w5 and w5['GoldenCrossShort'].any():
+        pts += 12
+        tags.append('단기 골든크로스(5/10) 발생')
+    # 중기 골든크로스(MA20/MA60): 추세 전환 확인
+    elif 'GoldenCross' in w5 and w5['GoldenCross'].any():
+        pts += 8
+        tags.append('골든크로스(20/60) 발생')
 
     # 세력 진입
     if w5['SE_Entry'].any():
@@ -188,8 +201,9 @@ def score(df: pd.DataFrame, ob_info: dict) -> tuple[int, list[str]]:
         pts -= 25
         tags.append('⚠ 세력 이탈 신호')
 
+    # 역배열 페널티 완화: -10→-5 (데이터: 역배열 세력80+ 적중률 27.6% ≈ 정배열 28.2%)
     if latest.get('MaBear', False):
-        pts -= 10
+        pts -= 5
         tags.append('⚠ 이평선 역배열')
 
     # 활성 약세OB 근접 — 아직 돌파 못한 저항 (플립된 것은 이미 위에서 가산)

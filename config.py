@@ -1,6 +1,6 @@
 # 세력 분석 시스템 설정
 
-MA_PERIODS = [5, 20, 60, 120, 240]
+MA_PERIODS = [5, 10, 20, 60, 120, 240]
 VOLUME_AVG_PERIOD = 30           # 거래량 기준 이평 기간 — 백테스트: 30일 D-5 46.8% (vs 20일 41.6%)
 VOL_ENTRY_THRESHOLD = 2.0        # 세력 진입 기준 — 백테스트 2.0x Lift 17.03x (3.0x: 10.36x)
 VOL_STRONG_THRESHOLD = 5.0       # 세력 강한 진입: 평균 거래량 5배

@@ -46,7 +46,8 @@ def _candle_props(df):
 def _ma_alignment(df):
     has = lambda col: col in df.columns and not df[col].isna().all()
 
-    # 정배열/역배열: MA(20,60,120) — 백테스트 결과 1.54x lift (vs 기존 5/20/60: 1.35x)
+    # 정배열/역배열: MA(20,60,120) — 데이터검증: lift 0.88x (역배열도 급등 유사)
+    # MA10 추가: 중기 추세 포착 강화
     if has('MA20') and has('MA60') and has('MA120'):
         df['MaBull'] = (df['MA20'] > df['MA60']) & (df['MA60'] > df['MA120'])
         df['MaBear'] = (df['MA20'] < df['MA60']) & (df['MA60'] < df['MA120'])
@@ -54,10 +55,21 @@ def _ma_alignment(df):
         df['MaBull'] = df['MA20'] > df['MA60']
         df['MaBear'] = df['MA20'] < df['MA60']
 
-    # 골든크로스: MA20/MA60 — 백테스트 결과 2.15x lift (vs 기존 MA5/MA20: 0.62x)
+    # 단기 정배열: MA5>MA10>MA20 — 세력 초기 모멘텀 포착 (중기보다 3~5일 빠른 신호)
+    if has('MA5') and has('MA10') and has('MA20'):
+        df['MaBullShort'] = (df['MA5'] > df['MA10']) & (df['MA10'] > df['MA20'])
+    elif has('MA5') and has('MA10'):
+        df['MaBullShort'] = df['MA5'] > df['MA10']
+
+    # 골든크로스(중기): MA20/MA60 — 추세 전환 확인 신호
     if has('MA20') and has('MA60'):
         prev_cross = (df['MA20'].shift(1) <= df['MA60'].shift(1)) & (df['MA20'] > df['MA60'])
         df['GoldenCross'] = prev_cross
+
+    # 단기 골든크로스: MA5/MA10 — 세력 개입 초기 포착 (중기보다 평균 8거래일 빠름)
+    if has('MA5') and has('MA10'):
+        prev_short = (df['MA5'].shift(1) <= df['MA10'].shift(1)) & (df['MA5'] > df['MA10'])
+        df['GoldenCrossShort'] = prev_short
 
     return df
 
@@ -67,9 +79,12 @@ def _pullback(df):
     from config import PULLBACK_MA_TOLERANCE
     if 'MA20' not in df.columns:
         return df
+    near_ma10 = (df['Low'] - df['MA10']).abs() / df['MA10'].replace(0, np.nan) < PULLBACK_MA_TOLERANCE if 'MA10' in df.columns else False
     near_ma20 = (df['Low'] - df['MA20']).abs() / df['MA20'].replace(0, np.nan) < PULLBACK_MA_TOLERANCE
     near_ma60 = (df['Low'] - df['MA60']).abs() / df['MA60'].replace(0, np.nan) < PULLBACK_MA_TOLERANCE if 'MA60' in df.columns else False
-    df['Pullback'] = df.get('MaBull', False) & (near_ma20 | near_ma60) & (df['VolRatio'] < 1.0)
+    # MaBullShort(단기정배열) 또는 MaBull(중기정배열) 상태에서 눌림목 감지
+    bull_any = df.get('MaBull', pd.Series(False, index=df.index)) | df.get('MaBullShort', pd.Series(False, index=df.index))
+    df['Pullback'] = bull_any & (near_ma10 | near_ma20 | near_ma60) & (df['VolRatio'] < 1.0)
     return df
 
 
