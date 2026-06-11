@@ -108,11 +108,10 @@ SCORE_HISTORY_PATH       = Path(__file__).parent / 'score_history.json'
 
 # 날짜 기준 스캔 (None이면 오늘, 'YYYYMMDD'이면 해당 종가 기준)
 _SCAN_END_DATE: str | None = None
-# 연속 보너스 역전 (데이터 분석 기반):
-# 연속2일 = 가장 빠른 급등(평균2.4일, 78% 3일내)
-# 연속7일+ = lift 0.00x → 보너스 감소
-# 1일=15, 2일=20, 3일=12, 4일+=8 (신규일수록 강한 신호)
-PERSISTENCE_BONUS_TABLE  = {1: 10, 2: 5, 3: 3, 4: 2}  # 데이터검증: 연속2일=0%, 4일+=3% → 대폭 축소
+# 데이터검증(2026-06): 연속2일=0%, 연속3일+=2.8% (기저율14.9% 대비 역효과)
+# 연속 출현 = 이미 급등이 반영된 종목 → 신규 진입 시점 지남
+# → 연속 보너스 완전 제거, 신규 신호(1일)만 소폭 유지
+PERSISTENCE_BONUS_TABLE  = {1: 5}  # 첫 출현만 +5 (데이터: 1일째가 최고 신선도)
 
 # 엘리트 픽 기준 — 10% 검증: 세력 80+ 핵심 (1.92x lift)
 # 세력 60-69는 노이즈, 합산 점수보다 세력 점수 우선
@@ -240,10 +239,12 @@ def _get_elite_picks(results: list, consec_map: dict) -> list:
     """백테스트 기반 엘리트 픽 필터.
 
     조건 (복수 해당 가능):
-      Tier1: 세력≥90 + 급등≥65  (극강 세력 + 급등 임박)
-      Tier2: 세력≥80 + 거래량>3x (세력 포착 + 폭발형 진입)
-      Tier3: 세력≥75 + 연속3일+  (지속 세력 + 반복 확인)
-      Tier4: 급등≥80 + 연속2일+  (급등 임박 + 이중 확인)
+      Tier1: 세력≥90 + 급등≥65        (극강 세력 + 급등 임박)
+      Tier2: 세력≥80 + 거래량>3x      (세력 포착 + 폭발형 진입)
+      Tier3: 세력≥70 + 수급≥80        (최강 복합 75% 적중, lift 5.03x)
+      Tier4: 세력≥70 + 수급≥50        (복합 33.8% 적중, lift 2.26x)
+      Tier5: 쇼트스퀴즈+세력≥70
+      Tier6: 거래량3x+ + 수급≥50      (폭발 거래량 + 기관/외인 동반)
     """
     elite = []
     seen  = set()
@@ -252,6 +253,7 @@ def _get_elite_picks(results: list, consec_map: dict) -> list:
         se     = r.get('seoryeok',  0)
         sg     = r.get('surge',     0)
         vr     = r.get('vol_ratio', 0)
+        inv    = r.get('investor',  0)
         consec = consec_map.get(ticker, 0)
         reasons = []
 
@@ -259,18 +261,19 @@ def _get_elite_picks(results: list, consec_map: dict) -> list:
             reasons.append(f'Tier1 세력{se}+급등{sg}')
         if se >= ELITE_SE_TIER2 and vr > ELITE_VOL_TIER2:
             reasons.append(f'Tier2 세력{se}+거래량{vr:.1f}x')
-        if se >= ELITE_SE_TIER3 and consec >= ELITE_CONSEC_TIER3:
-            reasons.append(f'Tier3 세력{se}+{consec}일연속')
-        if sg >= ELITE_SG_TIER4 and consec >= ELITE_CONSEC_TIER4:
-            reasons.append(f'Tier4 급등{sg}+{consec}일연속')
+        # Tier3: 세력70+수급80+ (데이터: 75% 적중률, lift 5.03x)
+        if se >= 70 and inv >= 80:
+            reasons.append(f'Tier3 세력{se}+수급{inv}(75% 적중)')
+        # Tier4: 세력70+수급50+ (데이터: 33.8% 적중률, lift 2.26x)
+        elif se >= 70 and inv >= 50:
+            reasons.append(f'Tier4 세력{se}+수급{inv}(33.8% 적중)')
         # Tier5: 쇼트 스퀴즈 가능성 + 세력 진입
         short = r.get('short', {})
         if short.get('squeeze') and se >= 70:
             reasons.append(f'Tier5 쇼트스퀴즈+세력{se}')
-        # Tier6: 세력70+&수급50+ (섹터 모멘텀 주도 급등 포착)
-        inv = r.get('investor', 0)
-        if se >= 70 and inv >= 50:
-            reasons.append(f'Tier6 세력{se}+수급{inv}')
+        # Tier6: 거래량 폭발 + 수급 동반 (수급80+거래량2x+ = 66.7% 적중)
+        if vr >= 2.0 and inv >= 50:
+            reasons.append(f'Tier6 거래량{vr:.1f}x+수급{inv}')
 
         if reasons and ticker not in seen:
             seen.add(ticker)
@@ -306,6 +309,19 @@ def analyze_one(ticker: str) -> dict | None:
         inv_pts,   inv_tags   = score_investors(ticker, df)
         pat_pts,   pat_tags   = score_patterns(df)
         combo = combined_score(s_pts, surge_pts, inv_pts, pat_pts)
+
+        # 세력×수급 복합 보너스 (데이터검증 2026-06):
+        #   SE70+수급80+ = 75.0% 적중률 (lift 5.03x) → +20pt
+        #   SE70+수급50+ = 33.8% 적중률 (lift 2.26x) → +10pt
+        #   SE70+수급<20 = 9.8% 적중률 (lift 0.66x, 기저율 이하) → -10pt
+        if s_pts >= 70 and inv_pts >= 80:
+            combo = min(100, combo + 20)
+            surge_tags = list(surge_tags) + ['★ 세력+수급 최강(75% 적중)']
+        elif s_pts >= 70 and inv_pts >= 50:
+            combo = min(100, combo + 10)
+            surge_tags = list(surge_tags) + ['★ 세력+수급 복합(33.8% 적중)']
+        elif s_pts >= 70 and inv_pts < 20:
+            combo = max(0, combo - 10)   # 수급 없는 세력 신호는 기저율 이하
 
         # 세력 60+ 이면 합산 무관 포함 (검증: 세력고점 종목은 저합산도 급등 가능)
         if s_pts < SEORYEOK_OVERRIDE_GATE and combo < FINAL_MIN_COMBINED:
@@ -803,11 +819,12 @@ def build_report(results: list, scan_market: str) -> str:
     # 데이터 기반 핵심 가이드
     lines.append('')
     lines.append('  ┌─ 의사결정 핵심 원칙 (데이터 검증) ─────────────────────────────────')
-    lines.append('  │  세력점수 = 유일한 예측 피처 (+5.9pt 차이)  |  합산점수 ≠ 예측력')
-    lines.append('  │  거래량 2x+ + 세력80+ → 평균 2.0일 내 급등 (100% 3일내)')
-    lines.append('  │  세력70+ & 수급50+ → 5일 적중률 33.8% (2.27x lift) ★ Tier6 핵심')
-    lines.append('  │  세력70+ & 수급80+ → 5일 적중률 75.0% (5.03x lift) ★★★ 최강 신호')
-    lines.append('  │  SE_Entry + 수급50+ → 5일 적중률 66.7% (4.47x lift) ★★★ 즉시 진입')
+    lines.append('  │  합산70+ = 6.1% 적중률(lift 0.41x) ← 패턴 과대평가 주의')
+    lines.append('  │  합산40-55 = 18.9% 최고 구간 | 세력+수급 조합이 핵심')
+    lines.append('  │  세력70+ & 수급50+ → 33.8% (lift 2.26x) ★ Tier6 핵심')
+    lines.append('  │  세력70+ & 수급80+ → 75.0% (lift 5.03x) ★★★ 최강 신호')
+    lines.append('  │  세력70+ & 수급<20  → 9.8%  (lift 0.66x) ⚠ 기저율 이하 주의')
+    lines.append('  │  연속2일=0% / 연속3일+=2.8% → 연속 출현은 급등 소진 신호')
     lines.append(f'  │  ML모델: {model_stats()}')
     lines.append('  └──────────────────────────────────────────────────────────────────')
 
@@ -823,10 +840,10 @@ def build_report(results: list, scan_market: str) -> str:
 
     lines.append(sep)
     if elite_picks:
-        lines.append('  ★★★★ 엘리트픽 — 세력점수 최우선 + 급등 타이밍 예측')
-        lines.append('  ┌ Tier1: 세력≥90+급등 ┬ Tier2: 세력≥80+거래량2x+')
-        lines.append('  ├ Tier3: 세력≥75+연속3일 ┼ Tier4: 세력≥70+연속2일')
-        lines.append('  ├ Tier5: 쇼트스퀴즈+세력≥70 ┼ Tier6: 세력≥70+수급≥50 ┘')
+        lines.append('  ★★★★ 엘리트픽 — 세력×수급 복합 신호 (데이터 기반)')
+        lines.append('  ┌ Tier1: 세력≥90+급등 ┬ Tier2: 세력≥80+거래량3x+')
+        lines.append('  ├ Tier3: 세력≥70+수급≥80(75%적중) ┼ Tier4: 세력≥70+수급≥50(33.8%)')
+        lines.append('  ├ Tier5: 쇼트스퀴즈+세력≥70 ┼ Tier6: 거래량3x++수급≥50 ┘')
         lines.append(sep2)
         lines.append(
             f'  {"종목명":<14} {"현재가":>9} {"세력":>4} {"수급":>4} {"거래량":>6}'
@@ -1476,6 +1493,11 @@ def main(market: str = 'ALL', scan_date: str | None = None):
 
 
 if __name__ == '__main__':
-    market_arg = sys.argv[1] if len(sys.argv) > 1 else 'ALL'
-    date_arg   = sys.argv[2] if len(sys.argv) > 2 else None
+    # 날짜 단독 전달 허용: python3 daily_scan.py 2026-06-11
+    if len(sys.argv) == 2 and sys.argv[1][:2] == '20' and '-' in sys.argv[1]:
+        market_arg = 'ALL'
+        date_arg   = sys.argv[1]
+    else:
+        market_arg = sys.argv[1] if len(sys.argv) > 1 else 'ALL'
+        date_arg   = sys.argv[2] if len(sys.argv) > 2 else None
     main(market_arg, scan_date=date_arg)

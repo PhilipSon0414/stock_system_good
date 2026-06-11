@@ -13,7 +13,8 @@ from datetime import datetime, timedelta
 
 def get_ohlcv(ticker: str, period_days: int = 400, end_date: str | None = None) -> pd.DataFrame:
     if end_date:
-        end_dt = datetime.strptime(end_date, '%Y%m%d')
+        fmt = '%Y-%m-%d' if '-' in end_date else '%Y%m%d'
+        end_dt = datetime.strptime(end_date, fmt)
     else:
         end_dt = datetime.now()
     start = (end_dt - timedelta(days=period_days)).strftime('%Y-%m-%d')
@@ -66,7 +67,9 @@ def get_ticker_list(market: str = 'ALL', date_str: str | None = None) -> pd.Data
         frames = []
         try:
             from pykrx import stock as _stock
-            target = date_str or datetime.now().strftime('%Y%m%d')
+            # pykrx는 YYYYMMDD 형식 필요 — 하이픈 포함 날짜 자동 변환
+            _raw = date_str or datetime.now().strftime('%Y%m%d')
+            target = _raw.replace('-', '')
             for m in markets:
                 try:
                     df_ok = _stock.get_market_ohlcv_by_ticker(target, market=m)
