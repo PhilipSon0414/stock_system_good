@@ -236,15 +236,16 @@ def _get_consecutive_days() -> dict:
 
 
 def _get_elite_picks(results: list, consec_map: dict) -> list:
-    """백테스트 기반 엘리트 픽 필터.
+    """백테스트 기반 엘리트 픽 필터 (2026-06-12 925건 재학습).
 
     조건 (복수 해당 가능):
-      Tier1: 세력≥90 + 급등≥65        (극강 세력 + 급등 임박)
-      Tier2: 세력≥80 + 거래량>3x      (세력 포착 + 폭발형 진입)
-      Tier3: 세력≥70 + 수급≥80        (최강 복합 75% 적중, lift 5.03x)
-      Tier4: 세력≥70 + 수급≥50        (복합 33.8% 적중, lift 2.26x)
-      Tier5: 쇼트스퀴즈+세력≥70
-      Tier6: 거래량3x+ + 수급≥50      (폭발 거래량 + 기관/외인 동반)
+      Tier1: 세력≥90 + 급등≥65                  (극강 세력 + 급등 임박)
+      Tier2: 세력≥80 + 거래량>2x                 (세력 포착 + 폭발형 진입)
+      Tier3: 세력≥70 + 수급≥60 + 급등30~70       (3중 복합 47~60% 적중, lift 3.2~4.0x)
+      Tier4: 세력≥70 + 수급≥80                   (최강 복합 75%+ 적중, lift 5.0x)
+      Tier5: 세력≥70 + 수급≥50                   (복합 33.8% 적중, lift 2.26x)
+      Tier6: 쇼트스퀴즈+세력≥70
+      Tier7: 거래량2x+ + 수급≥50                 (폭발 거래량 + 기관/외인 동반)
     """
     elite = []
     seen  = set()
@@ -261,19 +262,22 @@ def _get_elite_picks(results: list, consec_map: dict) -> list:
             reasons.append(f'Tier1 세력{se}+급등{sg}')
         if se >= ELITE_SE_TIER2 and vr > ELITE_VOL_TIER2:
             reasons.append(f'Tier2 세력{se}+거래량{vr:.1f}x')
-        # Tier3: 세력70+수급80+ (데이터: 75% 적중률, lift 5.03x)
+        # Tier3: 세력70+수급60+급등30~70 (3중 복합: 47~60% 적중, lift 3.2~4.0x — 최강 실증 조합)
+        if se >= 70 and inv >= 60 and 30 <= sg < 70:
+            reasons.append(f'Tier3 3중복합(SE{se}+수급{inv}+급등{sg}) 47~60%적중')
+        # Tier4: 세력70+수급80+ (75%+ 적중)
         if se >= 70 and inv >= 80:
-            reasons.append(f'Tier3 세력{se}+수급{inv}(75% 적중)')
-        # Tier4: 세력70+수급50+ (데이터: 33.8% 적중률, lift 2.26x)
+            reasons.append(f'Tier4 세력{se}+수급{inv}(75%+ 적중)')
+        # Tier5: 세력70+수급50+ (33.8% 적중)
         elif se >= 70 and inv >= 50:
-            reasons.append(f'Tier4 세력{se}+수급{inv}(33.8% 적중)')
-        # Tier5: 쇼트 스퀴즈 가능성 + 세력 진입
+            reasons.append(f'Tier5 세력{se}+수급{inv}(33.8% 적중)')
+        # Tier6: 쇼트 스퀴즈 가능성 + 세력 진입
         short = r.get('short', {})
         if short.get('squeeze') and se >= 70:
-            reasons.append(f'Tier5 쇼트스퀴즈+세력{se}')
-        # Tier6: 거래량 폭발 + 수급 동반 (수급80+거래량2x+ = 66.7% 적중)
+            reasons.append(f'Tier6 쇼트스퀴즈+세력{se}')
+        # Tier7: 거래량 폭발 + 수급 동반
         if vr >= 2.0 and inv >= 50:
-            reasons.append(f'Tier6 거래량{vr:.1f}x+수급{inv}')
+            reasons.append(f'Tier7 거래량{vr:.1f}x+수급{inv}')
 
         if reasons and ticker not in seen:
             seen.add(ticker)
@@ -310,18 +314,49 @@ def analyze_one(ticker: str) -> dict | None:
         pat_pts,   pat_tags   = score_patterns(df)
         combo = combined_score(s_pts, surge_pts, inv_pts, pat_pts)
 
-        # 세력×수급 복합 보너스 (데이터검증 2026-06):
-        #   SE70+수급80+ = 75.0% 적중률 (lift 5.03x) → +20pt
-        #   SE70+수급50+ = 33.8% 적중률 (lift 2.26x) → +10pt
-        #   SE70+수급<20 = 9.8% 적중률 (lift 0.66x, 기저율 이하) → -10pt
-        if s_pts >= 70 and inv_pts >= 80:
+        # ── 데이터 기반 복합 보너스/패널티 (2026-06-12 925건 분석) ──────────────
+        # 3중 최강 조합 (표본 10+, 기저율 14.9% 대비):
+        #   SE70+ 수급60+ 급등30~70 = 47~60% (lift 3.2~4.0x) → +25pt ★★★
+        #   SE80+ 수급60+ 급등30~70 = 50% (lift 3.35x)       → +25pt ★★★
+        #   SE70+수급80+ = 75%+ 적중률                        → +20pt ★★
+        #   SE70+수급60+ = 33.8%+                             → +10pt ★
+        # 패널티:
+        #   급등90+ 수급<40 = 3.0% (lift 0.20x) — 거의 0에 가까운 역효과  → -25pt
+        #   급등80~90 수급<40 = 8.6% (lift 0.57x) — 기저율 이하           → -15pt
+        #   급등80+ 수급<60 = 6.8% (lift 0.46x) — 과열 확실               → -15pt
+        #   패턴40+ = 3.6% 극역상관 (더 높을수록 나쁨)                      → -10pt
+        #   패턴20~40 = 11% (기저율 이하)                                   → -5pt
+        #   SE70+ 수급<20 = 9.8% (lift 0.66x, 기저율 이하)                 → -10pt
+
+        # 3중 최강 조합 우선 (보너스 중복 허용)
+        if s_pts >= 70 and inv_pts >= 60 and 30 <= surge_pts < 70:
+            combo = min(100, combo + 25)
+            surge_tags = list(surge_tags) + ['★★★ 세력+수급+급등 3중(47~60% 적중)']
+        elif s_pts >= 70 and inv_pts >= 80:
             combo = min(100, combo + 20)
-            surge_tags = list(surge_tags) + ['★ 세력+수급 최강(75% 적중)']
+            surge_tags = list(surge_tags) + ['★★ 세력+수급 최강(75% 적중)']
         elif s_pts >= 70 and inv_pts >= 50:
             combo = min(100, combo + 10)
             surge_tags = list(surge_tags) + ['★ 세력+수급 복합(33.8% 적중)']
+
+        # 패턴 역상관 패널티 (패턴 높을수록 급등률 하락)
+        if pat_pts >= 40:
+            combo = max(0, combo - 10)   # 패턴40+: 3.6% (극역상관)
+        elif pat_pts >= 20:
+            combo = max(0, combo - 5)    # 패턴20~40: 11% (기저율 이하)
+
+        # 급등 과열 패널티 (수급 없는 급등 과열은 기저율보다 낮음)
+        if surge_pts >= 90 and inv_pts < 40:
+            combo = max(0, combo - 25)   # 급등90+수급<40: 3.0% — 거의 폭탄
+            surge_tags = list(surge_tags) + ['⚠ 급등과열+수급없음(3% 역효과)']
+        elif surge_pts >= 80 and inv_pts < 40:
+            combo = max(0, combo - 15)   # 급등80~90수급<40: 8.6%
+            surge_tags = list(surge_tags) + ['⚠ 급등과열(8.6% 역효과)']
+        elif surge_pts >= 80 and inv_pts < 60:
+            combo = max(0, combo - 15)   # 급등80+수급<60: 6.8%
+            surge_tags = list(surge_tags) + ['⚠ 급등과열(6.8% 역효과)']
         elif s_pts >= 70 and inv_pts < 20:
-            combo = max(0, combo - 10)   # 수급 없는 세력 신호는 기저율 이하
+            combo = max(0, combo - 10)   # 세력70+수급<20: 9.8% 기저율 이하
 
         # 세력 60+ 이면 합산 무관 포함 (검증: 세력고점 종목은 저합산도 급등 가능)
         if s_pts < SEORYEOK_OVERRIDE_GATE and combo < FINAL_MIN_COMBINED:
@@ -818,12 +853,15 @@ def build_report(results: list, scan_market: str) -> str:
 
     # 데이터 기반 핵심 가이드
     lines.append('')
-    lines.append('  ┌─ 의사결정 핵심 원칙 (데이터 검증) ─────────────────────────────────')
-    lines.append('  │  합산70+ = 6.1% 적중률(lift 0.41x) ← 패턴 과대평가 주의')
-    lines.append('  │  합산40-55 = 18.9% 최고 구간 | 세력+수급 조합이 핵심')
-    lines.append('  │  세력70+ & 수급50+ → 33.8% (lift 2.26x) ★ Tier6 핵심')
-    lines.append('  │  세력70+ & 수급80+ → 75.0% (lift 5.03x) ★★★ 최강 신호')
-    lines.append('  │  세력70+ & 수급<20  → 9.8%  (lift 0.66x) ⚠ 기저율 이하 주의')
+    lines.append('  ┌─ 의사결정 핵심 원칙 (925건 실증 데이터, 기저율 14.9%) ─────────────')
+    lines.append('  │  ★★★ SE70+수급60+급등30~70 = 47~60% (lift 3.2~4.0x) ← 최강 3중')
+    lines.append('  │  ★★  SE70+수급80+ = 75%+  (lift 5.0x)  ← 세력+수급 최고조합')
+    lines.append('  │  ★   SE70+수급50+ = 33.8% (lift 2.26x) ← 중간 복합 신호')
+    lines.append('  │  ⚠  급등90+수급<40 = 3.0%  (lift 0.20x) ← 과열=역효과 (폭탄!)')
+    lines.append('  │  ⚠  급등80+수급<60 = 6.8%  (lift 0.46x) ← 과열 패널티 적용')
+    lines.append('  │  ⚠  패턴40+ = 3.6%  (lift 0.24x) ← 패턴 고점=역효과 (제외 대상)')
+    lines.append('  │  ⚠  합산70+ = 6.1%  (lift 0.41x) ← 합산 맹신 금지 (패턴 인플레)')
+    lines.append('  │  수급80+단독 = 38.5% (lift 2.58x) | 세력80+ = 31.7% (lift 2.13x)')
     lines.append('  │  연속2일=0% / 연속3일+=2.8% → 연속 출현은 급등 소진 신호')
     lines.append(f'  │  ML모델: {model_stats()}')
     lines.append('  └──────────────────────────────────────────────────────────────────')
@@ -840,10 +878,10 @@ def build_report(results: list, scan_market: str) -> str:
 
     lines.append(sep)
     if elite_picks:
-        lines.append('  ★★★★ 엘리트픽 — 세력×수급 복합 신호 (데이터 기반)')
-        lines.append('  ┌ Tier1: 세력≥90+급등 ┬ Tier2: 세력≥80+거래량3x+')
-        lines.append('  ├ Tier3: 세력≥70+수급≥80(75%적중) ┼ Tier4: 세력≥70+수급≥50(33.8%)')
-        lines.append('  ├ Tier5: 쇼트스퀴즈+세력≥70 ┼ Tier6: 거래량3x++수급≥50 ┘')
+        lines.append('  ★★★★ 엘리트픽 — 세력×수급×급등 복합 신호 (925건 실증)')
+        lines.append('  ┌ Tier1: 세력≥90+급등 ┬ Tier2: 세력≥80+거래량2x+')
+        lines.append('  ├ Tier3: SE70+수급60+급등30~70(47~60%!) ┼ Tier4: SE70+수급80+(75%+)')
+        lines.append('  ├ Tier5: SE70+수급50+(33.8%) ┼ Tier6: 쇼트스퀴즈 ┼ Tier7: 거래량2x++수급50+ ┘')
         lines.append(sep2)
         lines.append(
             f'  {"종목명":<14} {"현재가":>9} {"세력":>4} {"수급":>4} {"거래량":>6}'
@@ -1461,17 +1499,18 @@ def main(market: str = 'ALL', scan_date: str | None = None):
             preds.append({
                 'ticker':         r['ticker'],
                 'stage':          sr.get('predicted', 'normal'),
-                'confidence':     sr.get('confidence', 0),
-                'pre_surge_prob': sr.get('pre_surge_prob', 0),
-                'price':          r.get('price', 0),
-                'vol_ratio':      r.get('vol_ratio', 0),
+                'confidence':     float(sr.get('confidence', 0) or 0),
+                'pre_surge_prob': float(sr.get('pre_surge_prob', 0) or 0),
+                'price':          float(r.get('price', 0) or 0),
+                'vol_ratio':      float(r.get('vol_ratio', 0) or 0),
                 'rsi14':          float(latest.get('RSI14', 0) or 0),
                 'atr_compress':   float(latest.get('ATRCompress', 1) or 1),
-                'rs_vs_market':   r.get('rs_vs_market', 0) or 0,
-                'price_vs_ma20':  r.get('price_vs_ma20', 0) or 0,
+                'rs_vs_market':   float(r.get('rs_vs_market', 0) or 0),
+                'price_vs_ma20':  float(r.get('price_vs_ma20', 0) or 0),
                 'vol_recovery':   bool(latest.get('VolRecovery', False)),
-                'short_ratio':    (r.get('short') or {}).get('ratio', 0),
+                'short_ratio':    float((r.get('short') or {}).get('ratio', 0) or 0),
                 'sector':         '',
+                'sm_score':       0,
             })
 
         n_saved = save_predictions(preds, market='KR')
