@@ -22,10 +22,10 @@ SCREEN_MIN_VOLUME = 50_000       # 최소 거래량 (저유동성 제외)
 SCREEN_MIN_PRICE = 1_000         # 최소 주가 (동전주 제외)
 
 # 합산 점수 가중치 (합계 = 1.0) — learned_weights.json이 있으면 자동 덮어씀
-W_SEORYEOK = 0.25                # 세력 흔적
+W_SEORYEOK = 0.30                # 세력 흔적
 W_SURGE    = 0.30                # 급등 임박
-W_INVESTOR = 0.25                # 외국인/기관 수급
-W_PATTERN  = 0.20                # 차트 패턴
+W_INVESTOR = 0.37                # 외국인/기관 수급
+W_PATTERN  = 0.03                # 차트 패턴 (925건 실증 역상관 → 하향)
 
 # 학습된 가중치 로드 (daily_learner.py가 매일 업데이트)
 import json as _json

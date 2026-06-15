@@ -12,6 +12,7 @@
 """
 
 import json
+import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -19,6 +20,23 @@ SCRIPT_DIR   = Path(__file__).parent
 HISTORY_FILE = SCRIPT_DIR / 'score_history.json'
 
 WINDOWS = [3, 5, 10, 20]   # 추적 윈도우 (거래일)
+
+
+def _market_regime():
+    """시장 레짐(stock_market 브리핑 net 게이지, -1~+1) 1회 조회.
+    하위 패키지 config 이름 충돌 방지를 위해 cwd 격리 서브프로세스로 실행.
+    실패 시 None (모델이 결측 처리)."""
+    smdir = SCRIPT_DIR.parent / 'stock_market'
+    code = ('import warnings;warnings.filterwarnings("ignore");'
+            'from config import INDICATORS;from fetch import collect;'
+            'from scoring import compute_gauge;'
+            'print(round(compute_gauge(INDICATORS,collect(INDICATORS))["net"],4))')
+    try:
+        out = subprocess.run(['python3', '-c', code], cwd=str(smdir),
+                             capture_output=True, text=True, timeout=120)
+        return float(out.stdout.strip().splitlines()[-1])
+    except Exception:
+        return None
 
 BANDS = [
     ('세력80+',  80, 101, 'seoryeok'),
@@ -81,6 +99,9 @@ def record_scores(results: list, scan_date: str | None = None):
     data = _load()
     existing = {(r['scan_date'], r['ticker']) for r in data['records']}
 
+    regime = _market_regime()   # 시장 레짐 1회 조회(전 종목 공통)
+    print(f'  [추적] 시장 레짐(net): {regime}')
+
     new_count = 0
     for r in results:
         if (scan_date, r['ticker']) in existing:
@@ -115,6 +136,7 @@ def record_scores(results: list, scan_date: str | None = None):
             'high52w_dist':  float(latest.get('High52W_Dist', 1.0)) if hasattr(latest, 'get') else 1.0,
             'consec_days':   r.get('consec_days', 0),
             'sector_rs':     (r.get('sector_rs') or {}).get('rs_score', 0),
+            'market_regime': regime,   # 시장 레짐(net) — 개별종목×시장국면 학습용
             # ── 결과 추적 ─────────────────────────────────────────
             'surged_by_3d':  None,
             'surged_by_5d':  None,

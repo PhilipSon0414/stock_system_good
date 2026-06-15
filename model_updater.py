@@ -22,14 +22,18 @@ LEARNED_WEIGHTS = SCRIPT_DIR / 'learned_weights.json'
 
 ALPHA           = 0.15   # EMA 학습률 (새 데이터 15%, 기존 85%)
 LEARNING_WINDOW = 30     # 가중치 계산에 사용할 최근 관측치 수
-MIN_WEIGHT      = 0.10   # 컴포넌트 최소 가중치
+MIN_WEIGHT      = 0.10   # 컴포넌트 최소 가중치(기본)
 MAX_WEIGHT      = 0.50   # 컴포넌트 최대 가중치
+# [2026-06-16] 컴포넌트별 하한 — 차트패턴은 925건 실증상 급등 역상관(lift 0.24x)이라
+#   기존 0.10 플로어가 매 학습마다 패턴을 ~0.095로 끌어올리는 부작용이 있었다.
+#   패턴 하한을 0.02로 완화해 자동학습이 패턴을 낮게 유지하도록 한다.
+MIN_WEIGHT_BY   = {'W_PATTERN': 0.02}
 
 DEFAULT_WEIGHTS = {
-    'W_SEORYEOK': 0.25,
+    'W_SEORYEOK': 0.30,
     'W_SURGE':    0.30,
-    'W_INVESTOR': 0.25,
-    'W_PATTERN':  0.20,
+    'W_INVESTOR': 0.37,
+    'W_PATTERN':  0.03,
 }
 
 COMPONENT_MAP = {
@@ -81,7 +85,8 @@ def _normalize(weights: dict) -> dict:
         return DEFAULT_WEIGHTS.copy()
     normalized = {k: v / total for k, v in weights.items()}
     # 클램핑 후 재정규화
-    clamped = {k: max(MIN_WEIGHT, min(MAX_WEIGHT, v)) for k, v in normalized.items()}
+    clamped = {k: max(MIN_WEIGHT_BY.get(k, MIN_WEIGHT), min(MAX_WEIGHT, v))
+               for k, v in normalized.items()}
     total2 = sum(clamped.values())
     return {k: round(v / total2, 6) for k, v in clamped.items()}
 
