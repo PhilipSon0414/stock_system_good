@@ -14,6 +14,7 @@
 
 import json
 import os
+import random
 import sys
 import time
 from datetime import datetime, timedelta
@@ -102,6 +103,7 @@ SEORYEOK_MIN_GATE        = 15         # 세력 흔적 최소 점수 (20→15: �
 FINAL_MIN_COMBINED       = 25         # 최종 리포트 포함 최소 합산점수 (35→25: 완화)
 SEORYEOK_OVERRIDE_GATE   = 60         # 세력 60+ 이면 합산 점수 무시하고 포함
 TOP_N_REPORT             = 50         # 전체 순위 50개
+UNIVERSE_SAMPLE_RATE     = 0.15       # 탈락 종목 학습용 샘플링 비율(선택편향 해소·ML 음성)
 TOP_N_DETAIL             = 20         # 상세 분석 상위 20개
 
 SCORE_HISTORY_PATH       = Path(__file__).parent / 'score_history.json'
@@ -246,6 +248,7 @@ def _get_elite_picks(results: list, consec_map: dict) -> list:
       Tier5: 세력≥70 + 수급≥50                   (복합 33.8% 적중, lift 2.26x)
       Tier6: 쇼트스퀴즈+세력≥70
       Tier7: 거래량2x+ + 수급≥50                 (폭발 거래량 + 기관/외인 동반)
+      Tier8: 거래량3x+ 단독                       (수급 무관, 실증 lift 2.06x — 저세력 급등 회수)
     """
     elite = []
     seen  = set()
@@ -278,12 +281,19 @@ def _get_elite_picks(results: list, consec_map: dict) -> list:
         # Tier7: 거래량 폭발 + 수급 동반
         if vr >= 2.0 and inv >= 50:
             reasons.append(f'Tier7 거래량{vr:.1f}x+수급{inv}')
+        # Tier8: 거래량 폭발 단독 (수급 무관) — 2026-06-16 실증: 거래량3x+ 단독 lift 2.06x
+        #   (급등률 27.5% vs 기저 13.3%). 세력 미포착(저세력) 급등을 거래량으로 회수.
+        if vr >= 3.0:
+            reasons.append(f'Tier8 거래량폭발{vr:.1f}x단독(lift2.1x)')
 
         if reasons and ticker not in seen:
             seen.add(ticker)
             elite.append({**r, 'elite_reasons': reasons, 'consec': consec})
 
-    return sorted(elite, key=lambda x: (len(x['elite_reasons']), x['combined']), reverse=True)
+    # ① GBM 급등확률 우선 정렬(검증 +3.9%p AUC), 동률 시 티어수·합산점수
+    return sorted(elite, key=lambda x: (round(x.get('surge_prob') or 0, 3),
+                                        len(x['elite_reasons']), x['combined']),
+                  reverse=True)
 
 
 def analyze_one(ticker: str) -> dict | None:
@@ -360,6 +370,16 @@ def analyze_one(ticker: str) -> dict | None:
 
         # 세력 60+ 이면 합산 무관 포함 (검증: 세력고점 종목은 저합산도 급등 가능)
         if s_pts < SEORYEOK_OVERRIDE_GATE and combo < FINAL_MIN_COMBINED:
+            # 광범위 유니버스 로깅: 탈락 종목도 일부만 경량 기록(ML 학습 음성·선택편향 해소).
+            # 비싼 후속 분석(재무·공매도·DART·ML)은 생략하고 4점수+df만 담는다.
+            if random.random() < UNIVERSE_SAMPLE_RATE:
+                return {
+                    'ticker': ticker, 'name': get_name(ticker), 'price': close,
+                    'seoryeok': s_pts, 'surge': surge_pts, 'investor': inv_pts,
+                    'pattern': pat_pts, 'combined': combo, 'raw_combined': combo,
+                    'vol_ratio': round(df['VolRatio'].iloc[-1], 2) if 'VolRatio' in df.columns else 0,
+                    'df': df, 'ob': ob, 'below_gate': True,
+                }
             return None
 
         vol_ratio = round(df['VolRatio'].iloc[-1], 2) if 'VolRatio' in df.columns else 0
@@ -486,6 +506,13 @@ def run_scan(market: str = 'ALL') -> list:
 
     print()
 
+    # ② 광범위 유니버스 샘플 분리 (탈락 종목 — 학습 로깅용, 픽/리포트에서 제외)
+    universe_sample = [r for r in results if r.get('below_gate')]
+    results = [r for r in results if not r.get('below_gate')]
+    run_scan._universe_sample = universe_sample
+    if universe_sample:
+        print(f'  유니버스 샘플(탈락) 로깅 대상: {len(universe_sample)}개')
+
     # raw_combined 저장 (연속 보너스 적용 전 순수 점수 — ML 학습 및 역설 분석용)
     for r in results:
         r['raw_combined'] = r.get('combined', 0)
@@ -536,6 +563,18 @@ def run_scan(market: str = 'ALL') -> list:
                 r.get('consec_days', 0),
             )
     run_scan._consec_map = consec_map   # 전달용 임시 저장
+
+    # ① GBM 급등확률(검증된 4점수 모델, +3.9%p AUC) — 랭킹 보강용
+    try:
+        from surge_model import predict as _surge_predict
+        for r in results:
+            p = _surge_predict(r, horizon='surged_by_3d')
+            if p is not None:
+                r['surge_prob'] = round(p, 3)
+        if any('surge_prob' in r for r in results):
+            print('  GBM 급등확률 계산 완료(랭킹 보강)')
+    except Exception as e:
+        print(f'  [GBM] 급등확률 스킵: {e}')
 
     results.sort(key=lambda x: x['combined'], reverse=True)
     results = results[:TOP_N_REPORT]
@@ -885,7 +924,7 @@ def build_report(results: list, scan_market: str) -> str:
         lines.append(sep2)
         lines.append(
             f'  {"종목명":<14} {"현재가":>9} {"세력":>4} {"수급":>4} {"거래량":>6}'
-            f' {"vsMA20":>7} {"ML티어":>8} {"타이밍예측":>12}  조건'
+            f' {"vsMA20":>7} {"GBM":>5} {"ML티어":>8} {"타이밍예측":>12}  조건'
         )
         lines.append(sep2)
         for r in elite_picks:
@@ -898,6 +937,8 @@ def build_report(results: list, scan_market: str) -> str:
             ma_f  = '✅' if pvm and pvm>=0 else ('⚡' if pvm and pvm>=-5 else '❌')
             tier  = ml.get('tier','?')
             rate  = ml.get('hit_rate',0)
+            sp    = r.get('surge_prob')
+            sp_s  = f'{sp*100:.0f}%' if sp is not None else '  -'
 
             # 급등 타이밍 예측
             df_r   = r.get('df')
@@ -909,6 +950,7 @@ def build_report(results: list, scan_market: str) -> str:
                 f'  {r["name"]:<14} {r["price"]:>9,.0f}원'
                 f' {r["seoryeok"]:>4}점 {inv:>4}점 {vr:>5.1f}x'
                 f' {ma_s:>6}{ma_f}'
+                f' {sp_s:>5}'
                 f' Tier-{tier}({rate*100:.0f}%)'
                 f' {timing_s:>12}  {cond}'
             )
@@ -1448,8 +1490,8 @@ def main(market: str = 'ALL', scan_date: str | None = None):
         print('\n  세력 흔적 종목 없음.')
         return
 
-    # 오늘 점수 추적 기록
-    record_scores(results)
+    # 오늘 점수 추적 기록 (+ ② 탈락 유니버스 샘플 = 학습 음성)
+    record_scores(results + getattr(run_scan, '_universe_sample', []))
 
     report_text = build_report(results, market)
     print('\n' + report_text)

@@ -1,17 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-급등 예측 ML 모델 (풍부 피처) — 4개 압축점수의 한계를 넘기 위해
-원시 서브신호 + 시장 레짐까지 모델에 직접 공급한다.
+급등 예측 ML 모델 — 4개 컴포넌트 점수(세력·급등·수급·패턴)를 GBM으로
+비선형 결합해 선형 가중합 게이지의 한계를 넘는다.
 
-배경(2026-06): 선형 게이지(4점수)는 3일 급등 AUC ~0.48~0.57로 약함.
-원시 피처를 더한 GBM/로지스틱은 3일 AUC ~0.56~0.60으로 개선(n=390 검증).
-데이터가 쌓일수록 신뢰도↑. 충분히 검증되면 daily_scan 랭킹에 편입.
+검증(2026-06-16, 라벨 1033건 워크포워드, 2달 백필 데이터):
+  - 선형 게이지(4점수): AUC 0.584
+  - GBM(4점수):        AUC 0.623±0.007 (8시드, +3.9%p) ← 채택
+  - 원시피처(거래량/OB/DART) 추가는 기여 없음(4점수에 이미 반영, 과적합) → 제외
+  핵심: 데이터가 늘자 GBM의 비선형 결합이 안정적으로 선형을 능가.
 
-데이터: score_history.json 의 'se_entry' 보유 + 라벨 확정 레코드.
+운영: shadow 모드(평가/예측 제공). daily_scan 랭킹 편입은 별도 결정.
 
 사용법:
-    python3 surge_model.py eval               # 워크포워드 AUC (선형 vs 모델)
-    python3 surge_model.py train surged_by_3d # 학습·저장
+    python3 surge_model.py eval               # 워크포워드 AUC (선형 vs GBM)
+    python3 surge_model.py train              # 학습·저장
 """
 import json
 import sys
@@ -29,18 +31,19 @@ SCRIPT_DIR = Path(__file__).parent
 HISTORY = SCRIPT_DIR / 'score_history.json'
 
 COMP = ['seoryeok', 'surge', 'investor', 'pattern']
-RAW = ['vol_ratio', 'se_entry', 'se_accum', 'se_exit', 'ma_bull', 'golden_cross',
-       'nr7', 'vcp', 'obv_diverge', 'high52w_dist', 'consec_days', 'sector_rs']
-REGIME = ['market_regime']
-FEATURES = COMP + RAW + REGIME
+# [2026-06-16 검증] 라벨 1033건 워크포워드:
+#   GBM(4점수) AUC 0.623±0.007 > 선형 0.584 (+3.9%p, 8시드 안정).
+#   원시피처(거래량/OB/DART)는 4점수에 이미 녹아 있어 추가 기여 없음(오히려 과적합).
+#   → 검증된 피처셋 = 4점수만. (RAW/REGIME는 향후 데이터 누적 시 재검토)
+FEATURES = COMP
 
-# 현재 선형 게이지 가중치(비교 기준)
-LIN_W = {'seoryeok': 0.428, 'surge': 0.143, 'investor': 0.333, 'pattern': 0.095}
+# 현재 선형 게이지 가중치(비교 기준, 교정 후)
+LIN_W = {'seoryeok': 0.428, 'surge': 0.143, 'investor': 0.398, 'pattern': 0.03}
 
 
 def _ready_records():
     recs = json.load(open(HISTORY, encoding='utf-8'))['records']
-    recs = [r for r in recs if 'se_entry' in r]   # 원시피처 보유
+    recs = [r for r in recs if all(k in r for k in COMP)]   # 4점수 보유 전체
     recs.sort(key=lambda r: r['scan_date'])
     return recs
 
@@ -84,9 +87,9 @@ def evaluate(horizon='surged_by_3d'):
         return float(np.mean(a)) if a else float('nan')
 
     print(f"  선형 게이지(4점수)         {cv(lin, False):.3f}")
-    print(f"  로지스틱(풍부피처)          {cv(lambda: _mk('lr'), True):.3f}")
-    print(f"  GBM(풍부피처)              {cv(lambda: _mk('gbm'), True):.3f}")
-    print(f"  피처: {len(FEATURES)}개 (압축점수4 + 원시{len(RAW)} + 레짐1)")
+    print(f"  로지스틱(4점수)            {cv(lambda: _mk('lr'), True):.3f}")
+    print(f"  GBM(4점수)                  {cv(lambda: _mk('gbm'), True):.3f}")
+    print(f"  피처: {len(FEATURES)}개 ({', '.join(FEATURES)})")
 
 
 def train_and_save(horizon='surged_by_3d', kind='gbm'):

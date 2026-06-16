@@ -136,7 +136,11 @@ def record_scores(results: list, scan_date: str | None = None):
             'high52w_dist':  float(latest.get('High52W_Dist', 1.0)) if hasattr(latest, 'get') else 1.0,
             'consec_days':   r.get('consec_days', 0),
             'sector_rs':     (r.get('sector_rs') or {}).get('rs_score', 0),
+            'near_bull_ob':  bool((r.get('ob') or {}).get('near_bull', False)),
+            'near_bear_ob':  bool((r.get('ob') or {}).get('near_bear', False)),
             'market_regime': regime,   # 시장 레짐(net) — 개별종목×시장국면 학습용
+            'below_gate':    bool(r.get('below_gate', False)),  # 탈락 유니버스 샘플 여부
+            'surge_prob':    r.get('surge_prob'),               # GBM 급등확률(3일)
             # ── 결과 추적 ─────────────────────────────────────────
             'surged_by_3d':  None,
             'surged_by_5d':  None,
