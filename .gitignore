@@ -29,3 +29,8 @@ __pycache__/
 *.bak
 *.tmp
 *_backup_*
+
+# ── 모델 가중치는 백업 예외 (사용자 요청 2026-06-16) ─────────────────────
+!learned_weights.json
+!surge_model_surged_by_3d.pkl
+!surge_model_surged_by_5d.pkl
