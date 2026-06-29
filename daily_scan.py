@@ -296,6 +296,21 @@ def _get_elite_picks(results: list, consec_map: dict) -> list:
                   reverse=True)
 
 
+def _ret_feats(df):
+    """급락+거래량 검증 피처: 5·20일 수익률(ret5/ret20). surge_model GBM 입력.
+    검증(라벨 1712건 워크포워드, 2026-06-30): 4점수 대비 5일급등 AUC +13.9%p,
+    3일 +3.7%p (ret5가 핵심 동력). '강세 급눌림'이 급등 선행."""
+    try:
+        close = float(df['Close'].iloc[-1])
+        c6 = float(df['Close'].iloc[-6]) if len(df) >= 6 else close
+        c21 = float(df['Close'].iloc[-21]) if len(df) >= 21 else close
+        ret5 = round(close / c6 - 1, 4) if c6 else 0.0
+        ret20 = round(close / c21 - 1, 4) if c21 else 0.0
+        return ret5, ret20
+    except Exception:
+        return 0.0, 0.0
+
+
 def analyze_one(ticker: str) -> dict | None:
     """단일 종목 전체 분석. 실패 시 None 반환."""
     try:
@@ -373,11 +388,13 @@ def analyze_one(ticker: str) -> dict | None:
             # 광범위 유니버스 로깅: 탈락 종목도 일부만 경량 기록(ML 학습 음성·선택편향 해소).
             # 비싼 후속 분석(재무·공매도·DART·ML)은 생략하고 4점수+df만 담는다.
             if random.random() < UNIVERSE_SAMPLE_RATE:
+                _r5, _r20 = _ret_feats(df)
                 return {
                     'ticker': ticker, 'name': get_name(ticker), 'price': close,
                     'seoryeok': s_pts, 'surge': surge_pts, 'investor': inv_pts,
                     'pattern': pat_pts, 'combined': combo, 'raw_combined': combo,
                     'vol_ratio': round(df['VolRatio'].iloc[-1], 2) if 'VolRatio' in df.columns else 0,
+                    'ret5': _r5, 'ret20': _r20,
                     'df': df, 'ob': ob, 'below_gate': True,
                 }
             return None
@@ -435,11 +452,14 @@ def analyze_one(ticker: str) -> dict | None:
         except Exception:
             pass
 
+        _r5, _r20 = _ret_feats(df)
         return {
             'ticker':        ticker,
             'name':          get_name(ticker),
             'price':         close,
             'vol_ratio':     vol_ratio,
+            'ret5':          _r5,
+            'ret20':         _r20,
             'seoryeok':      s_pts,
             'surge':         surge_pts,
             'investor':      inv_pts,

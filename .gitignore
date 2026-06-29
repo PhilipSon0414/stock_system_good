@@ -1,7 +1,11 @@
 # ── 민감 정보 (절대 커밋 금지) ──────────────────────────────────────────
-email_config.json          # Gmail 앱 비밀번호 포함
-dart_config.json           # DART API 키 포함
-_macro_cache.json          # 매크로 캐시 (자동 생성)
+# 주의: git .gitignore는 인라인 주석(패턴 뒤 #)을 지원하지 않는다. 주석은 별도 줄에.
+# Gmail 앱 비밀번호 포함
+email_config.json
+# DART API 키 포함
+dart_config.json
+# 매크로 캐시 (자동 생성)
+_macro_cache.json
 
 # ── 대용량 데이터 파일 (로컬 전용) ───────────────────────────────────────
 learning_log.json
@@ -27,6 +31,7 @@ __pycache__/
 
 # ── 임시/백업 파일 ────────────────────────────────────────────────────
 *.bak
+*.bak_*
 *.tmp
 *_backup_*
 

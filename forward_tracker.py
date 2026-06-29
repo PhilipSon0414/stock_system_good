@@ -125,6 +125,8 @@ def record_scores(results: list, scan_date: str | None = None):
             'pattern':       r.get('pattern', 0),
             # ── ML 피처 (binary signals) ──────────────────────────
             'vol_ratio':     r.get('vol_ratio', 0),
+            'ret5':          r.get('ret5', 0.0),   # 5일 낙폭(GBM 피처, 검증 +14%p AUC)
+            'ret20':         r.get('ret20', 0.0),  # 20일 모멘텀(GBM 피처)
             'se_entry':      _flag('SE_Entry'),
             'se_accum':      _flag('SE_Accum'),
             'se_exit':       _flag('SE_Exit'),

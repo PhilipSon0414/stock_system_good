@@ -31,11 +31,13 @@ SCRIPT_DIR = Path(__file__).parent
 HISTORY = SCRIPT_DIR / 'score_history.json'
 
 COMP = ['seoryeok', 'surge', 'investor', 'pattern']
-# [2026-06-16 검증] 라벨 1033건 워크포워드:
-#   GBM(4점수) AUC 0.623±0.007 > 선형 0.584 (+3.9%p, 8시드 안정).
-#   원시피처(거래량/OB/DART)는 4점수에 이미 녹아 있어 추가 기여 없음(오히려 과적합).
-#   → 검증된 피처셋 = 4점수만. (RAW/REGIME는 향후 데이터 누적 시 재검토)
-FEATURES = COMP
+# [2026-06-16 검증] 라벨 1033건: GBM(4점수) 0.623 > 선형 0.584. 거래량/OB/DART 무기여.
+# [2026-06-30 검증] 라벨 1712건 워크포워드(8시드, TimeSeriesSplit)로 낙폭 피처 편입:
+#   +ret5(5일수익률)+ret20(20일) → 5일급등 AUC 0.541→0.680(+13.9%p),
+#   3일급등 0.610→0.647(+3.7%p). ret5가 핵심('강세 급눌림' 선행). vr은 노이즈라 제외.
+#   반등/과매도(RSI<30 lift 0.43x)는 반박돼 미편입. ret5/ret20은 daily_scan이 산출.
+EXTRA = ['ret5', 'ret20']
+FEATURES = COMP + EXTRA
 
 # 현재 선형 게이지 가중치(비교 기준, 교정 후)
 LIN_W = {'seoryeok': 0.428, 'surge': 0.143, 'investor': 0.398, 'pattern': 0.03}
@@ -86,9 +88,9 @@ def evaluate(horizon='surged_by_3d'):
             a.append(roc_auc_score(y[te], p))
         return float(np.mean(a)) if a else float('nan')
 
-    print(f"  선형 게이지(4점수)         {cv(lin, False):.3f}")
-    print(f"  로지스틱(4점수)            {cv(lambda: _mk('lr'), True):.3f}")
-    print(f"  GBM(4점수)                  {cv(lambda: _mk('gbm'), True):.3f}")
+    print(f"  선형 게이지(4점수)          {cv(lin, False):.3f}")
+    print(f"  로지스틱({len(FEATURES)}피처)           {cv(lambda: _mk('lr'), True):.3f}")
+    print(f"  GBM({len(FEATURES)}피처)                {cv(lambda: _mk('gbm'), True):.3f}")
     print(f"  피처: {len(FEATURES)}개 ({', '.join(FEATURES)})")
 
 
