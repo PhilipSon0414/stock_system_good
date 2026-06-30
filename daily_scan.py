@@ -676,8 +676,10 @@ def _calc_ob_trade_params(ob: dict, price: float, r: dict) -> dict:
     entry = result['entry']
 
     # ── 목표가 결정 ──────────────────────────────────────────────
-    # 1순위: 가장 가까운 위쪽 약세OB
-    bear_obs = [b for b in ob.get('bear', []) if b['Low'] > entry]
+    # 1순위: 가장 가까운 위쪽 약세OB. 단 저항이 현재가 +3% 안쪽이면 목표로 부적합
+    # (×0.99 할인 시 목표가 현재가 아래로 떨어져 R:R 음수가 되는 버그 방지).
+    TARGET_FLOOR = 1.03
+    bear_obs = [b for b in ob.get('bear', []) if b['Low'] > entry * TARGET_FLOOR]
     bear_obs_sorted = sorted(bear_obs, key=lambda x: x['Low'])
 
     df = r.get('df')
@@ -722,6 +724,18 @@ def _calc_ob_trade_params(ob: dict, price: float, r: dict) -> dict:
         if risk > 0:
             result['rr_ratio']        = round(profit / risk, 2)
             result['expected_return'] = round(profit / entry * 100, 1)
+
+    # ── R:R 불리 시 진입 등급 강등 ───────────────────────────────
+    # 목표≤현재가 또는 R:R<1.0 이면 기대값 비우호 → '즉시 진입' 라벨을 보류로 교정.
+    # (신호 레이어가 '즉시진입'이라도 매매 수학이 음수면 신규진입 부적합)
+    rr = result.get('rr_ratio')
+    unfavorable = (result['target'] is not None and result['target'] <= entry) or \
+                  (rr is not None and rr < 1.0)
+    result['rr_unfavorable'] = bool(unfavorable)
+    if unfavorable:
+        rr_txt = f"R:R {rr:.1f}" if rr is not None else "목표<현재가"
+        result['entry_desc'] = (f"⚠ 진입보류({rr_txt} 불리·저항 근접) — "
+                                f"눌림목 대기 권장 (현재가 {price:,.0f}원)")
 
     return result
 
@@ -976,6 +990,8 @@ def build_report(results: list, scan_market: str) -> str:
             )
         lines.append(sep2)
         lines.append(f'  ※ 엘리트픽 {len(elite_picks)}종목 | 즉시 모니터링')
+        lines.append('  ※ 타이밍 N일내(X%)는 거래량·세력 유형별 평균(57건 소표본)이라 종목별 확률 아님')
+        lines.append('     → 종목별 검증 확률은 GBM 컬럼(1659건 학습) 참고')
     else:
         lines.append('  ★★★★ 엘리트픽: 해당 없음')
         lines.append(sep2)
