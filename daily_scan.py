@@ -1131,6 +1131,7 @@ def build_report(results: list, scan_market: str) -> str:
         df_r = r.get('df')
         ma_bull = bool(df_r.iloc[-1].get('MaBull',False)) if df_r is not None and len(df_r)>0 else False
         timing = predict_surge_timing(se, vr, ma_bull, r.get('consec_days',0))
+        ob_params = _calc_ob_trade_params(r.get('ob', {}), r['price'], r)
 
         # 투자 판단 (세력점수 + ML 티어 기준)
         tier = ml.get('tier','D')
@@ -1142,6 +1143,9 @@ def build_report(results: list, scan_market: str) -> str:
             verdict = '★   모니터링'
         else:
             verdict = '    관망'
+        # R:R 비우호(목표≤현재가 or R:R<1.0)면 '즉시 진입' 강등 — 매매 수학 우선
+        if ob_params.get('rr_unfavorable') and '즉시 진입' in verdict:
+            verdict = '★★  진입보류(R:R 불리·저항근접)'
 
         # 스테이지 태그
         stage_r = r.get('stage')
@@ -1203,8 +1207,7 @@ def build_report(results: list, scan_market: str) -> str:
         lines.append(f'         예상 {timing["expected_days"]:.0f}거래일 후  |  '
                      f'3일내 {timing["confidence_pct"]}%  |  {timing["holding_advice"]}')
 
-        # OB 매매전략 (항상 표시)
-        ob_params = _calc_ob_trade_params(r.get('ob', {}), r['price'], r)
+        # OB 매매전략 (항상 표시) — ob_params는 verdict 계산 시 이미 산출됨(재사용)
         if ob_params.get('rr_ratio'):
             rr_icon = '✅ 유리' if ob_params['rr_ratio']>=2 else ('⚠ 보통' if ob_params['rr_ratio']>=1 else '❌ 불리')
             lines.append(f'       ┌─ OB 매매전략 {"─"*45}')
