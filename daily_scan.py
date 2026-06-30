@@ -906,6 +906,82 @@ def _format_ob_lines(ob: dict, price: float) -> list:
     return lines
 
 
+def _build_focus_picks(results: list, top_n: int = 5) -> list:
+    """오늘의 집중 픽: GBM(surge_prob) 상위 + R:R 유리 + 미발동(D+0/D+1 제외) top_n.
+
+    데이터 검증(2026-06-30, 라벨 1661건 GBM 채점): 매일 상위 N개 매수 시 적중률
+    N=1 45.8% → N=5 37.5% → N=10 30.4%(기저 11.4%). 정밀도는 소수 픽에서 포화하고
+    N≥6부터 하락 → 분산까지 감안한 실전 최적 N=4~5. R:R불리·이미발동은 기대값↓라 제외.
+    """
+    cand = []
+    for r in results:
+        if r.get('surge_prob') is None:
+            continue
+        ob = _calc_ob_trade_params(r.get('ob', {}), r['price'], r)
+        if ob.get('rr_unfavorable'):          # 목표≤현재가 or R:R<1 → 제외
+            continue
+        stage = (r.get('stage') or {}).get('predicted', 'normal')
+        if stage in ('D+0', 'D+1'):           # 이미 발동/후속 → 추격 제외
+            continue
+        r['_focus_ob'] = ob
+        r['_focus_stage'] = stage
+        cand.append(r)
+    cand.sort(key=lambda r: -(r.get('surge_prob') or 0))
+    return cand[:top_n]
+
+
+def _focus_reason(r) -> str:
+    """집중 픽 한 줄 근거(지배적 신호 기준)."""
+    se = r.get('seoryeok', 0); inv = r.get('investor', 0); vr = r.get('vol_ratio', 0) or 0
+    bits = []
+    if se >= 70 and inv >= 80:
+        bits.append('세력+수급80 (75%+ 실증조합)')
+    elif se >= 70 and inv >= 60:
+        bits.append('세력+수급 복합 (47~60%)')
+    elif se >= 70 and inv >= 50:
+        bits.append('세력+수급 복합 (33.8%)')
+    if vr >= 3:
+        bits.append(f'거래량{vr:.1f}x폭발(lift2.1x)')
+    elif vr >= 2:
+        bits.append(f'거래량{vr:.1f}x동반')
+    if se >= 90:
+        bits.append(f'세력{se} 최상위')
+    if not bits:
+        bits.append(f'세력{se}/수급{inv}')
+    return ' · '.join(bits[:2])
+
+
+def _render_focus_picks(picks: list, top_n: int = 5) -> list:
+    sep = '═' * 70
+    L = [sep,
+         f'  🎯 오늘의 집중 픽 TOP {top_n}  (GBM 상위 · R:R 유리 · 미발동만)',
+         f'  ※ 실증: 매일 상위 {top_n}개 ≈ 적중률 ~38%(기저 11%의 3.3x). R:R불리·이미발동 제외, 분산 위해 {top_n}종목.',
+         '─' * 70]
+    if not picks:
+        L.append('  (조건 충족 종목 없음 — R:R 유리 & 미발동 픽이 오늘은 부재)')
+        L.append(sep)
+        return L
+    for i, r in enumerate(picks, 1):
+        ob = r.get('_focus_ob', {})
+        sp = (r.get('surge_prob') or 0) * 100
+        tgt = ob.get('expected_return')
+        rr = ob.get('rr_ratio')
+        stage = r.get('_focus_stage', 'normal')
+        stage_s = {'D-1': 'D-1(임박)', 'D-2': 'D-2(1~2일)', 'D-3': 'D-3',
+                   'D-4': 'D-4', 'D-5': 'D-5(이른편)'}.get(stage, '대기')
+        tgt_s = f'목표 {tgt:+.1f}%' if tgt is not None else '목표 -'
+        rr_s = f'R:R {rr:.1f}' if rr is not None else 'R:R -'
+        L.append(f'  {i}. {r["name"]}({r["ticker"]})  '
+                 f'GBM {sp:.0f}%  세력{r.get("seoryeok",0)}/수급{r.get("investor",0)}  '
+                 f'거래량{(r.get("vol_ratio",0) or 0):.1f}x  {rr_s}  {tgt_s}  [{stage_s}]')
+        L.append(f'      └ {_focus_reason(r)}')
+    L.append('─' * 70)
+    L.append('  ※ GBM=종목별 검증 급등확률(1659건 학습). 절대치는 다소 낙관 — 순위·선별 효과가 핵심.')
+    L.append('  ※ 참고용이며 매매 권유 아님. 고용지표 등 이벤트 임박 시 분할·보수적 진입.')
+    L.append(sep)
+    return L
+
+
 def build_report(results: list, scan_market: str) -> str:
     now = datetime.now()
     lines = []
@@ -944,6 +1020,11 @@ def build_report(results: list, scan_market: str) -> str:
     if macro:
         for mline in build_macro_report_lines(macro):
             lines.append(mline)
+    lines.append('')
+
+    # ── 🎯 오늘의 집중 픽 TOP 5 (선택 폭 압축 → 적중률↑) ──────────────────────
+    focus = _build_focus_picks(results, top_n=5)
+    lines += _render_focus_picks(focus, top_n=5)
     lines.append('')
 
     # ── 엘리트 픽 (세력점수 기준 재편) ────────────────────────────────────────
