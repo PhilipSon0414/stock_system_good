@@ -50,6 +50,20 @@ def _yf_symbol(code, market):
     return f"{code}.{'KS' if market == 'KOSPI' else 'KQ'}"
 
 
+def live_session_today():
+    """KRX 실시간 세션 여부 — KOSPI 지수 5분봉 최근 캔들이 '오늘'이면 today, 아니면 None.
+    휴장/장외에 stale(전 거래일) 데이터를 today로 오기록하는 것을 방지(무인 가드)."""
+    import yfinance as yf
+    today = datetime.now().strftime('%Y-%m-%d')
+    try:
+        idx = yf.Ticker('^KS11').history(period='1d', interval='5m')
+        if idx is not None and len(idx) and str(idx.index[-1].date()) == today:
+            return today
+    except Exception:
+        pass
+    return None
+
+
 def build_universe(market='ALL', top_n=200):
     """유동성 상위 유니버스 — 가격·거래량 필터 후 거래량 내림차순 top_n."""
     df = get_ticker_list(market)
@@ -239,14 +253,20 @@ def main():
     if '--loop' in args:
         loop_min = int(args[args.index('--loop') + 1])
 
+    force = '--force' in args   # 신선도 가드 무시(테스트/드라이런)
+
     def run():
+        live = force or live_session_today()
         fired, controls, n = scan_once(top_n=top_n)
-        scan_date = datetime.now().strftime('%Y-%m-%d')
-        added = log_ignitions(fired, controls, scan_date)
         report = render(fired, n)
         print("\n" + report + "\n")
-        print(f"  [추적] 로그 기록 {added}건(점화 {len(fired)}+대조 {len(controls)}) "
-              f"→ intraday_eval.py로 정밀도 검증", file=sys.stderr)
+        if live:
+            scan_date = datetime.now().strftime('%Y-%m-%d')
+            added = log_ignitions(fired, controls, scan_date)
+            print(f"  [추적] 로그 기록 {added}건(점화 {len(fired)}+대조 {len(controls)}) "
+                  f"→ intraday_eval.py로 정밀도 검증", file=sys.stderr)
+        else:
+            print("  [추적] 실시간 세션 아님(휴장/장외) — 로깅 생략", file=sys.stderr)
         if do_email and fired:
             try:
                 from email_sender import send_report
@@ -258,9 +278,16 @@ def main():
         return fired
 
     if loop_min:
-        print(f"[장중 점화 루프] {loop_min}분 간격 — Ctrl+C 종료", file=sys.stderr)
+        from datetime import time as _t
+        OPEN, CLOSE = _t(9, 0), _t(15, 35)
+        print(f"[장중 점화 루프] {loop_min}분 간격 · 09:00~15:35 자동 종료", file=sys.stderr)
         while True:
-            run()
+            now_t = datetime.now().time()
+            if now_t > CLOSE:
+                print("[장중 점화 루프] 장 마감 — 종료", file=sys.stderr)
+                break
+            if OPEN <= now_t <= CLOSE:
+                run()
             time.sleep(loop_min * 60)
     else:
         run()
