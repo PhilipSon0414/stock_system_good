@@ -969,7 +969,9 @@ def _render_focus_picks(picks: list, top_n: int = 5) -> list:
         stage = r.get('_focus_stage', 'normal')
         stage_s = {'D-1': 'D-1(임박)', 'D-2': 'D-2(1~2일)', 'D-3': 'D-3',
                    'D-4': 'D-4', 'D-5': 'D-5(이른편)'}.get(stage, '대기')
-        tgt_s = f'목표 {tgt:+.1f}%' if tgt is not None else '목표 -'
+        # 비현실적 원거리 목표(>30%·R:R 2자리)는 신뢰도 표기 — 먼 저항/신고가 기반
+        far = (tgt is not None and tgt > 30) or (rr is not None and rr >= 6)
+        tgt_s = (f'목표 {tgt:+.1f}%' + ('⚠원거리' if far else '')) if tgt is not None else '목표 -'
         rr_s = f'R:R {rr:.1f}' if rr is not None else 'R:R -'
         L.append(f'  {i}. {r["name"]}({r["ticker"]})  '
                  f'GBM {sp:.0f}%  세력{r.get("seoryeok",0)}/수급{r.get("investor",0)}  '
