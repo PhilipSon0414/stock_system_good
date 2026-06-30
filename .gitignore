@@ -13,6 +13,7 @@ learning_log_backup_*.json
 score_history.json
 score_history_backup_*.json
 learned_weights.json
+intraday_log.json
 model_backtest_results.json
 timeframe_results.json
 selection_tracking_results.json

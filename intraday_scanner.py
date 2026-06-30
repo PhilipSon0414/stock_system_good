@@ -30,6 +30,7 @@ EOD 스캔이 못 뽑은 종목을 우선 표시한다(무징후 회수).
 import sys
 import time
 import json
+import random
 import warnings
 from datetime import datetime
 from pathlib import Path
@@ -41,6 +42,8 @@ SCRIPT_DIR = Path(__file__).parent
 BARS_FULL_DAY = 78           # 09:00~15:30, 5분봉 78개
 MIN_PRICE = 1000
 MIN_AVG_VOL = 50000
+LOG_FILE = SCRIPT_DIR / 'intraday_log.json'   # 점화·대조군 추적 로그(로컬)
+CONTROL_RATE = 0.10          # 비점화 대조군 샘플링률(선택편향 제거 → 정확한 base/lift)
 
 
 def _yf_symbol(code, market):
@@ -137,25 +140,71 @@ def scan_once(market='ALL', top_n=200):
     uni = build_universe(market, top_n)
     today = datetime.now().strftime('%Y-%m-%d')
     eod = _eod_combined_map(today)
-    fired = []
+    fired, controls = [], []
     for i, (code, name, mkt) in enumerate(uni):
         s = intraday_signals(code, mkt)
         if not s:
             continue
         tier = ignition_tier(s)
-        if not tier:
-            continue
-        s['name'] = name
-        s['tier'], s['tier_label'] = tier
-        s['eod_combined'] = eod.get(code)
-        # EOD 미포착(무징후) = 회수 대상
-        s['eod_missed'] = (s['eod_combined'] is None or s['eod_combined'] < 40)
-        fired.append(s)
+        if tier:
+            s['name'] = name
+            s['tier'], s['tier_label'] = tier
+            s['eod_combined'] = eod.get(code)
+            # EOD 미포착(무징후) = 회수 대상
+            s['eod_missed'] = (s['eod_combined'] is None or s['eod_combined'] < 40)
+            fired.append(s)
+        elif random.random() < CONTROL_RATE:
+            # 비점화 대조군: 정확한 base rate 산출용(선택편향 제거)
+            s['name'] = name
+            controls.append(s)
         if (i + 1) % 50 == 0:
             print(f'  …{i+1}/{len(uni)} 스캔 (점화 {len(fired)})', file=sys.stderr, flush=True)
     order = {'T1': 0, 'T2': 1, 'T3': 2}
     fired.sort(key=lambda x: (order[x['tier']], -x['vol_pace']))
-    return fired, len(uni)
+    return fired, controls, len(uni)
+
+
+def log_ignitions(fired, controls, scan_date):
+    """점화·대조군을 추적 로그에 기록(outcome=None). 같은 날 같은 종목 1회만(강한 tier 우선)."""
+    data = {'records': []}
+    if LOG_FILE.exists():
+        try:
+            data = json.load(open(LOG_FILE, encoding='utf-8'))
+        except Exception:
+            data = {'records': []}
+    seen = {(r['scan_date'], r['ticker']) for r in data['records']}
+
+    def mk(s, is_ig):
+        return {
+            'scan_date': scan_date,
+            'logged_at': datetime.now().strftime('%H:%M'),
+            'ticker': s['code'], 'name': s.get('name', s['code']),
+            'is_ignition': is_ig,
+            'tier': s.get('tier'),
+            'ig_price': s['last'],
+            'day_chg': round(s['day_chg'], 4),
+            'vol_pace': round(s['vol_pace'], 2),
+            'vwap_dev': round(s['vwap_dev'], 4),
+            'accel': round(s['accel'], 4),
+            'breakout': bool(s['breakout']),
+            'eod_missed': bool(s.get('eod_missed', True)),
+            'surged_by_3d': None, 'surged_by_5d': None,
+        }
+
+    added = 0
+    for s in fired:
+        k = (scan_date, s['code'])
+        if k in seen:
+            continue
+        seen.add(k); data['records'].append(mk(s, True)); added += 1
+    for s in controls:
+        k = (scan_date, s['code'])
+        if k in seen:
+            continue
+        seen.add(k); data['records'].append(mk(s, False)); added += 1
+    data['records'] = data['records'][-20000:]
+    json.dump(data, open(LOG_FILE, 'w', encoding='utf-8'), ensure_ascii=False)
+    return added
 
 
 def render(fired, n_uni):
@@ -191,9 +240,13 @@ def main():
         loop_min = int(args[args.index('--loop') + 1])
 
     def run():
-        fired, n = scan_once(top_n=top_n)
+        fired, controls, n = scan_once(top_n=top_n)
+        scan_date = datetime.now().strftime('%Y-%m-%d')
+        added = log_ignitions(fired, controls, scan_date)
         report = render(fired, n)
         print("\n" + report + "\n")
+        print(f"  [추적] 로그 기록 {added}건(점화 {len(fired)}+대조 {len(controls)}) "
+              f"→ intraday_eval.py로 정밀도 검증", file=sys.stderr)
         if do_email and fired:
             try:
                 from email_sender import send_report
