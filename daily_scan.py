@@ -984,6 +984,99 @@ def _render_focus_picks(picks: list, top_n: int = 5) -> list:
     return L
 
 
+FOCUS_HIST_FILE = Path(__file__).parent / 'focus_history.json'   # 집중 픽 이력(로컬)
+
+
+def _save_focus_history(picks: list, scan_date: str):
+    """오늘 집중 픽을 이력에 저장(carry-over 추적용). 같은 날짜는 갱신."""
+    data = {'batches': []}
+    if FOCUS_HIST_FILE.exists():
+        try:
+            data = json.load(open(FOCUS_HIST_FILE, encoding='utf-8'))
+        except Exception:
+            data = {'batches': []}
+    def _f(v):   # numpy/None → JSON 안전 네이티브
+        return None if v is None else float(v)
+    data['batches'] = [b for b in data.get('batches', []) if b.get('date') != scan_date]
+    data['batches'].append({
+        'date': scan_date,
+        'picks': [{
+            'ticker': str(r['ticker']), 'name': str(r.get('name', r['ticker'])),
+            'sel_price': _f(r.get('price', 0)) or 0.0,
+            'gbm': int(round((r.get('surge_prob') or 0) * 100)),
+            'target_pct': _f((r.get('_focus_ob') or {}).get('expected_return')),
+            'stage': str(r.get('_focus_stage', 'normal')),
+        } for r in picks],
+    })
+    data['batches'] = data['batches'][-15:]
+    try:
+        json.dump(data, open(FOCUS_HIST_FILE, 'w', encoding='utf-8'), ensure_ascii=False)
+    except Exception as e:
+        print(f'[집중픽이력] 저장 스킵: {e}', file=sys.stderr)
+
+
+def _render_carryover(scan_date: str) -> list:
+    """직전 집중 픽들의 현재 성과 추적(선정가 대비 등락·최고·급등달성). 없으면 []."""
+    if not FOCUS_HIST_FILE.exists():
+        return []
+    try:
+        data = json.load(open(FOCUS_HIST_FILE, encoding='utf-8'))
+    except Exception:
+        return []
+    prior = sorted([b for b in data.get('batches', []) if b.get('date') != scan_date],
+                   key=lambda b: b['date'])
+    if not prior:
+        return []
+    last = prior[-1]
+    import pandas as pd
+    try:
+        sel_date = pd.to_datetime(last['date']).date()
+    except Exception:
+        return []
+    sep = '═' * 70
+    L = [sep, f'  📌 직전 집중 픽 추적  ({last["date"]} 선정 → 현재 성과)',
+         '  ※ 선정 후 실제 움직임 — 급등확률은 확률이라 하루 미달성은 정상(3일 창).',
+         '─' * 70]
+    n_hit = 0
+    for p in last['picks']:
+        try:
+            df = get_ohlcv(p['ticker'], period_days=30)
+            after = df[[d.date() > sel_date for d in df.index]]
+            sel = p['sel_price'] or 0
+            if len(after) == 0 or sel <= 0:
+                L.append(f"  · {p['name']}({p['ticker']})  선정 {sel:,.0f}원  — 아직 다음 거래일 전")
+                continue
+            cur = float(after['Close'].iloc[-1])
+            peak = float(after['High'].max())
+            cur_pct = (cur / sel - 1) * 100
+            peak_pct = (peak / sel - 1) * 100
+            # 단일일 10%+ 급등 발생 여부(시스템 정의)
+            prev = sel; hit = False
+            for j in range(len(after)):
+                c = float(after['Close'].iloc[j])
+                if c / prev - 1 >= 0.10:
+                    hit = True
+                prev = c
+            surged = hit or peak_pct >= 10.0
+            if surged:
+                n_hit += 1
+                icon = '🎯 급등달성'
+            elif len(after) < 3:
+                icon = '⏳ 진행중'
+            else:
+                icon = '⏹ 창마감'
+            L.append(f"  {icon}  {p['name']}({p['ticker']})  GBM{p['gbm']}%  "
+                     f"선정 {sel:,.0f}→{cur:,.0f}원  현재 {cur_pct:+.1f}%  최고 {peak_pct:+.1f}%  "
+                     f"({len(after)}일경과)")
+        except Exception:
+            continue
+    L.append('─' * 70)
+    L.append(f"  → 직전 {len(last['picks'])}픽 중 급등달성 {n_hit}건 "
+             f"(누적 성과는 매일 자동 추적)")
+    L.append(sep)
+    return L
+
+
 def build_report(results: list, scan_market: str) -> str:
     now = datetime.now()
     lines = []
@@ -1028,6 +1121,14 @@ def build_report(results: list, scan_market: str) -> str:
     focus = _build_focus_picks(results, top_n=5)
     lines += _render_focus_picks(focus, top_n=5)
     lines.append('')
+
+    # ── 📌 직전 집중 픽 추적 (carry-over: 거래량 감소로 사라진 종목도 끝까지 추적) ──
+    scan_date_str = (_SCAN_END_DATE or now.strftime('%Y-%m-%d'))
+    carry = _render_carryover(scan_date_str)
+    if carry:
+        lines += carry
+        lines.append('')
+    _save_focus_history(focus, scan_date_str)
 
     # ── 엘리트 픽 (세력점수 기준 재편) ────────────────────────────────────────
     elite_picks = _get_elite_picks(results, consec_map)

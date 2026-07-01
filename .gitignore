@@ -40,3 +40,6 @@ __pycache__/
 !learned_weights.json
 !surge_model_surged_by_3d.pkl
 !surge_model_surged_by_5d.pkl
+
+# 집중 픽 이력(로컬)
+focus_history.json
