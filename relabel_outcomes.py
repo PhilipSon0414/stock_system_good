@@ -23,12 +23,14 @@ from data_fetcher import get_ohlcv
 
 SH = Path(__file__).parent / 'score_history.json'
 SURGE_PCT = 0.10
+PRICE_LIMIT = 0.30   # KRX 일간 상하한 — 초과 인접변동 = 분할/권리락 아티팩트(무수정주가)
 HORIZONS = {'surged_by_3d': 3, 'surged_by_5d': 5,
             'surged_by_10d': 10, 'surged_by_20d': 20}
 
 
 def _relabel(df, scan_date, n):
-    """scan_date 이후 n거래일 내 단일일 10%+ → True / 만료 & 없음 → False / 미성숙 → None."""
+    """scan_date 이후 n거래일 내 단일일 10%+ → True / 만료 & 없음 → False / 미성숙 → None.
+    |인접변동|>30%(상하한 초과)는 데이터 아티팩트로 급등 판정에서 제외(Task A)."""
     idx = [i for i, d in enumerate(df.index) if str(d.date()) <= scan_date]
     if not idx:
         return None
@@ -39,8 +41,13 @@ def _relabel(df, scan_date, n):
     prev = float(df['Close'].iloc[pos])
     for j in range(len(fut)):
         c = float(fut['Close'].iloc[j])
-        if prev > 0 and c / prev - 1 >= SURGE_PCT:
-            return True
+        if prev > 0:
+            chg = c / prev - 1
+            if abs(chg) > PRICE_LIMIT:   # 아티팩트 → 급등 판정 제외, 스케일만 이월
+                prev = c
+                continue
+            if chg >= SURGE_PCT:
+                return True
         prev = c
     return False
 

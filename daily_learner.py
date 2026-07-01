@@ -139,7 +139,8 @@ def _surge_via_fdr(min_pct: float, date_str: str | None) -> list[dict]:
             if close_t1 <= 0:
                 return
             pct = (close_t - close_t1) / close_t1 * 100.0
-            if pct >= min_pct:
+            # |변동|>30%(KRX 상하한 초과) = 분할/권리락 아티팩트(무수정주가) → 제외
+            if pct >= min_pct and abs(pct) <= 30.0:
                 with lock:
                     results.append({'ticker': code, 'surge_pct': round(pct, 2)})
         except Exception:
