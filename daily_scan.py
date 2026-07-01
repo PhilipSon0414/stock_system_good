@@ -1077,6 +1077,23 @@ def _render_carryover(scan_date: str) -> list:
     return L
 
 
+def _current_calibration():
+    """score_history 완료 코호트의 실측 기저율·표본(5일). Task B: 화면 캘리브레이션.
+    옛 14.9%/925건 낙관치 대신 최신 실측을 리포트에 노출. 실패 시 None."""
+    try:
+        recs = json.load(open(Path(__file__).parent / 'score_history.json',
+                              encoding='utf-8'))['records']
+        done = [r for r in recs if r.get('surged_by_5d') is not None]
+        if len(done) < 30:
+            return None
+        pos = sum(1 for r in done if r['surged_by_5d'])
+        return {'base': pos / len(done) * 100, 'n': len(done),
+                'lo': min(r['scan_date'] for r in done),
+                'hi': max(r['scan_date'] for r in done)}
+    except Exception:
+        return None
+
+
 def build_report(results: list, scan_market: str) -> str:
     now = datetime.now()
     lines = []
@@ -1097,7 +1114,13 @@ def build_report(results: list, scan_market: str) -> str:
 
     # 데이터 기반 핵심 가이드
     lines.append('')
-    lines.append('  ┌─ 의사결정 핵심 원칙 (925건 실증 데이터, 기저율 14.9%) ─────────────')
+    _cal = _current_calibration()
+    if _cal:
+        lines.append(f'  ┌─ 의사결정 핵심 원칙 (아래 %·lift는 원조 925스터디 기준·참고) ────────')
+        lines.append(f'  │  ※ 현재 실측 기저율 {_cal["base"]:.1f}% (5일, 완료 {_cal["n"]}건, '
+                     f'{_cal["lo"]}~{_cal["hi"]}) ← 라이브 캘리브레이션')
+    else:
+        lines.append('  ┌─ 의사결정 핵심 원칙 (원조 925스터디 기준·참고) ────────────────────')
     lines.append('  │  ★★★ SE70+수급60+급등30~70 = 47~60% (lift 3.2~4.0x) ← 최강 3중')
     lines.append('  │  ★★  SE70+수급80+ = 75%+  (lift 5.0x)  ← 세력+수급 최고조합')
     lines.append('  │  ★   SE70+수급50+ = 33.8% (lift 2.26x) ← 중간 복합 신호')
