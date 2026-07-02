@@ -50,10 +50,21 @@ def _ready_records():
     return recs
 
 
+# 폭락/과열 극단값 클리핑 — 모델이 '강세 급눌림 반등'을 극단 폭락(-37% 등)에 외삽해
+# 과대추정하는 것 차단(검증: 클립 후 5일 AUC 0.662→0.664 유지·개선). 학습·추론 공통.
+_CLIP = {'ret5': (-0.20, 0.30), 'ret20': (-0.20, 0.50)}
+
+
+def _fval(v, k):
+    v = float(v) if v is not None else 0.0
+    if k in _CLIP:
+        lo, hi = _CLIP[k]; v = max(lo, min(hi, v))
+    return v
+
+
 def _matrix(recs):
     def f(r, k):
-        v = r.get(k, 0)
-        return float(v) if v is not None else 0.0   # 결측(레짐 등)→0
+        return _fval(r.get(k, 0), k)
     X = np.array([[f(r, k) for k in FEATURES] for r in recs])
     lin = np.array([sum(LIN_W[k] * f(r, k) for k in COMP) for r in recs])
     return X, lin
@@ -115,10 +126,7 @@ def predict(record: dict, horizon='surged_by_3d'):
     if not path.exists():
         return None
     bundle = joblib.load(path)
-    def f(k):
-        v = record.get(k, 0)
-        return float(v) if v is not None else 0.0
-    x = np.array([[f(k) for k in bundle['features']]])
+    x = np.array([[_fval(record.get(k, 0), k) for k in bundle['features']]])
     return float(bundle['model'].predict_proba(x)[0, 1])
 
 

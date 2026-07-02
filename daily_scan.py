@@ -917,6 +917,10 @@ def _build_focus_picks(results: list, top_n: int = 5) -> list:
     for r in results:
         if r.get('surge_prob') is None:
             continue
+        # 폭락주(falling knife) 제외: ret5<-20%는 '강세 급눌림'이 아니라 붕괴 →
+        # 모델이 반등신호를 극단 폭락에 외삽(오검증: 과매도 lift 0.43x). GBM 과대추정 차단.
+        if (r.get('ret5') or 0) < -0.20:
+            continue
         ob = _calc_ob_trade_params(r.get('ob', {}), r['price'], r)
         if ob.get('rr_unfavorable'):          # 목표≤현재가 or R:R<1 → 제외
             continue
