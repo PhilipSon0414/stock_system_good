@@ -158,9 +158,17 @@ def prefilter_tickers(market: str = 'ALL') -> list:
         df = df[df['Close'] >= PRE_FILTER_MIN_PRICE]
     if 'Volume' in df.columns:
         df = df[df['Volume'] >= PRE_FILTER_MIN_VOLUME]
+
+    # 순위 기준: 거래대금(종가×거래량) — 주식수 기준은 저가주가 상위를
+    # 독식해 정작 유동성 있는 중가·고가주를 밀어내는 편향이 있었다.
+    # (자체 진단: 급등주 97.9%가 거래량 사전필터에서 탈락)
+    if 'Close' in df.columns and 'Volume' in df.columns:
+        df = df.assign(_value=df['Close'] * df['Volume'])
+        df = df.sort_values('_value', ascending=False)
+    elif 'Volume' in df.columns:
         df = df.sort_values('Volume', ascending=False)
 
-    # 거래량 상위 N개만
+    # 거래대금 상위 N개만
     df = df.head(PRE_FILTER_MAX_STOCKS)
     return list(df['Code'])
 
@@ -494,8 +502,18 @@ def analyze_one(ticker: str) -> dict | None:
             'dart_info':       dart_info,
             'stage':           stage_result,   # 급등 사이클 스테이지
         }
-    except Exception:
+    except Exception as e:
+        # 무음 삼킴 금지: 과거 이 blanket except가 NameError 버그를 수개월
+        # 은폐해 이력 2일+ 종목 전체가 조용히 탈락했다. 집계·샘플 보존.
+        _ANALYZE_ERRORS['count'] += 1
+        if len(_ANALYZE_ERRORS['samples']) < 5:
+            _ANALYZE_ERRORS['samples'].append(
+                f'{ticker}: {type(e).__name__}: {e}')
         return None
+
+
+# analyze_one 예외 집계 (run_scan이 시작 시 리셋, 종료 시 요약 출력)
+_ANALYZE_ERRORS: dict = {'count': 0, 'samples': []}
 
 
 def run_scan(market: str = 'ALL') -> list:
@@ -519,6 +537,9 @@ def run_scan(market: str = 'ALL') -> list:
     print(f'\n  사전 필터 통과: {total}개 종목 분석 시작')
     print(f'  예상 소요 시간: 약 {total // 10}분\n')
 
+    _ANALYZE_ERRORS['count'] = 0
+    _ANALYZE_ERRORS['samples'] = []
+
     results = []
     for i, ticker in enumerate(tickers, 1):
         result = analyze_one(ticker)
@@ -535,6 +556,14 @@ def run_scan(market: str = 'ALL') -> list:
         time.sleep(0.1)
 
     print()
+
+    # 분석 예외 요약 — 조용한 탈락은 후보군을 보이지 않게 왜곡한다
+    if _ANALYZE_ERRORS['count']:
+        print(f'  ⚠ 분석 중 예외로 제외된 종목: {_ANALYZE_ERRORS["count"]}개')
+        for s in _ANALYZE_ERRORS['samples']:
+            print(f'     · {s}')
+        if _ANALYZE_ERRORS['count'] > len(_ANALYZE_ERRORS['samples']):
+            print(f'     · ... 외 {_ANALYZE_ERRORS["count"] - len(_ANALYZE_ERRORS["samples"])}건')
 
     # ② 광범위 유니버스 샘플 분리 (탈락 종목 — 학습 로깅용, 픽/리포트에서 제외)
     universe_sample = [r for r in results if r.get('below_gate')]
@@ -597,19 +626,41 @@ def run_scan(market: str = 'ALL') -> list:
             )
     run_scan._consec_map = consec_map   # 전달용 임시 저장
 
-    # ① GBM 급등확률(검증된 4점수 모델, +3.9%p AUC) — 랭킹 보강용
+    # ① GBM 급등확률 — 이제 1차 랭킹 키 (규칙 합산점수는 동률 보조)
+    # 검증: GBM AUC 0.647(3일)/0.680(5일) vs 선형 게이지 0.54~0.58.
+    # 기존엔 합산점수로 top-50을 먼저 자른 뒤 GBM은 그 안에서만 재정렬
+    # → 더 약한 점수가 더 강한 모델의 문지기 노릇. 순서를 뒤집는다.
+    # market_regime 피처 부착 — 신규 GBM 피처. record_scores가 저장하는 값과
+    # 동일 소스를 써서 학습(저장값)·추론(현재값) 분포를 일치시킨다.
+    try:
+        from forward_tracker import _market_regime
+        _regime = _market_regime()
+    except Exception:
+        _regime = None
+    if _regime is not None:
+        for r in results:
+            r['market_regime'] = _regime
+
     try:
         from surge_model import predict as _surge_predict
         for r in results:
             p = _surge_predict(r, horizon='surged_by_3d')
             if p is not None:
                 r['surge_prob'] = round(p, 3)
-        if any('surge_prob' in r for r in results):
-            print('  GBM 급등확률 계산 완료(랭킹 보강)')
     except Exception as e:
         print(f'  [GBM] 급등확률 스킵: {e}')
 
-    results.sort(key=lambda x: x['combined'], reverse=True)
+    n_prob = sum(1 for r in results if r.get('surge_prob') is not None)
+    if n_prob >= max(10, len(results) // 2):
+        # GBM 랭킹: 확률 1차, 합산점수 동률 보조
+        results.sort(key=lambda x: (x.get('surge_prob') or 0.0, x['combined']),
+                     reverse=True)
+        print(f'  랭킹 기준: GBM 급등확률 ({n_prob}/{len(results)}종목 채점, '
+              f'합산점수는 동률 보조)')
+    else:
+        # 모델 부재/채점 실패 다수 → 규칙 합산점수 폴백
+        results.sort(key=lambda x: x['combined'], reverse=True)
+        print(f'  랭킹 기준: 합산점수 폴백 (GBM 채점 {n_prob}/{len(results)}종목)')
     results = results[:TOP_N_REPORT]
 
     # 트리플 필터 + 앙상블 스코어링 실행

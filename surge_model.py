@@ -36,7 +36,11 @@ COMP = ['seoryeok', 'surge', 'investor', 'pattern']
 #   +ret5(5일수익률)+ret20(20일) → 5일급등 AUC 0.541→0.680(+13.9%p),
 #   3일급등 0.610→0.647(+3.7%p). ret5가 핵심('강세 급눌림' 선행). vr은 노이즈라 제외.
 #   반등/과매도(RSI<30 lift 0.43x)는 반박돼 미편입. ret5/ret20은 daily_scan이 산출.
-EXTRA = ['ret5', 'ret20']
+# [2026-07] market_regime(시장 브리핑 net 게이지 -1~+1) 편입 — record_scores가
+#   이미 전 레코드에 저장 중. 개별 종목 신호 × 시장 국면 상호작용 학습.
+#   ※ 재학습 필요: 기존 pkl은 자체 features 목록으로 계속 동작하므로 안전.
+#   ※ 편입 확정 전 `python3 surge_model.py eval`로 AUC 개선 확인할 것.
+EXTRA = ['ret5', 'ret20', 'market_regime']
 FEATURES = COMP + EXTRA
 
 # 현재 선형 게이지 가중치(비교 기준, 교정 후)
@@ -52,7 +56,13 @@ def _ready_records():
 
 # 폭락/과열 극단값 클리핑 — 모델이 '강세 급눌림 반등'을 극단 폭락(-37% 등)에 외삽해
 # 과대추정하는 것 차단(검증: 클립 후 5일 AUC 0.662→0.664 유지·개선). 학습·추론 공통.
-_CLIP = {'ret5': (-0.20, 0.30), 'ret20': (-0.20, 0.50)}
+_CLIP = {'ret5': (-0.20, 0.30), 'ret20': (-0.20, 0.50),
+         'market_regime': (-1.0, 1.0)}
+
+# 퍼지/엠바고 (캘린더 일수) — 라벨이 N거래일 미래를 보므로, 학습 폴드 끝부분
+# 레코드의 결과 윈도우가 검증 폴드 시작과 겹치는 경계 누수를 차단.
+_EMBARGO_CAL = {'surged_by_3d': 7, 'surged_by_5d': 10,
+                'surged_by_10d': 18, 'surged_by_20d': 32}
 
 
 def _fval(v, k):
@@ -77,12 +87,21 @@ def _mk(kind):
     return LogisticRegression(max_iter=2000, class_weight='balanced')
 
 
+def _purge_train(tr, te, recs, horizon):
+    """검증 폴드 시작 직전 엠바고 기간의 학습 레코드 제거 (경계 라벨 누수 차단)."""
+    from datetime import datetime, timedelta
+    te_start = datetime.strptime(recs[te[0]]['scan_date'][:10], '%Y-%m-%d')
+    cutoff = (te_start - timedelta(days=_EMBARGO_CAL.get(horizon, 10))
+              ).strftime('%Y-%m-%d')
+    return [i for i in tr if recs[i]['scan_date'][:10] < cutoff]
+
+
 def evaluate(horizon='surged_by_3d'):
     recs = [r for r in _ready_records() if r.get(horizon) is not None]
     X, lin = _matrix(recs)
     y = np.array([1 if r.get(horizon) else 0 for r in recs])
     print(f"■ 급등 예측 워크포워드 검증  ({horizon}, n={len(recs)}, "
-          f"기저 {y.mean()*100:.1f}%)")
+          f"기저 {y.mean()*100:.1f}%, 엠바고 {_EMBARGO_CAL.get(horizon, 10)}일)")
 
     def cv(scores_or_model, is_model, X_=None):
         t = TimeSeriesSplit(n_splits=4)
@@ -91,8 +110,12 @@ def evaluate(horizon='surged_by_3d'):
             if len(np.unique(y[te])) < 2:
                 continue
             if is_model:
+                # 퍼지: 라벨 윈도우가 검증 폴드와 겹치는 학습 꼬리 제거
+                tr_p = _purge_train(list(tr), list(te), recs, horizon)
+                if len(tr_p) < 30 or len(np.unique(y[tr_p])) < 2:
+                    continue
                 m = scores_or_model()
-                m.fit(X[tr], y[tr])
+                m.fit(X[tr_p], y[tr_p])
                 p = m.predict_proba(X[te])[:, 1]
             else:
                 p = scores_or_model[te]
@@ -120,12 +143,18 @@ def train_and_save(horizon='surged_by_3d', kind='gbm'):
     return path
 
 
+_BUNDLE_CACHE: dict = {}   # horizon → 로드된 모델 번들 (스캔당 1회만 디스크 접근)
+
+
 def predict(record: dict, horizon='surged_by_3d'):
-    """단일 종목 record로 급등확률 예측. 모델 없으면 None."""
-    path = SCRIPT_DIR / f'surge_model_{horizon}.pkl'
-    if not path.exists():
+    """단일 종목 record로 급등확률 예측. 모델 없으면 None.
+    기존엔 종목마다 pkl을 디스크에서 다시 로드(1500종목 × 매 스캔) — 캐싱."""
+    if horizon not in _BUNDLE_CACHE:
+        path = SCRIPT_DIR / f'surge_model_{horizon}.pkl'
+        _BUNDLE_CACHE[horizon] = joblib.load(path) if path.exists() else None
+    bundle = _BUNDLE_CACHE[horizon]
+    if bundle is None:
         return None
-    bundle = joblib.load(path)
     x = np.array([[_fval(record.get(k, 0), k) for k in bundle['features']]])
     return float(bundle['model'].predict_proba(x)[0, 1])
 

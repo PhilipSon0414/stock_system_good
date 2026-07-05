@@ -124,7 +124,11 @@ def record_scores(results: list, scan_date: str | None = None):
     data = _load()
     existing = {(r['scan_date'], r['ticker']) for r in data['records']}
 
-    regime = _market_regime()   # 시장 레짐 1회 조회(전 종목 공통)
+    # 시장 레짐: daily_scan이 이미 부착했으면 재사용 (서브프로세스 중복 호출 방지)
+    regime = next((r.get('market_regime') for r in results
+                   if r.get('market_regime') is not None), None)
+    if regime is None:
+        regime = _market_regime()   # 시장 레짐 1회 조회(전 종목 공통)
     print(f'  [추적] 시장 레짐(net): {regime}')
 
     new_count = 0
@@ -237,6 +241,63 @@ def update_outcomes(surge_tickers: list[str] | None = None,
               f'(대상 {len(pending)}기록, 조회실패 {failed}종목)')
 
 
+# ── 2b. precision@K (실전 픽 정밀도) ─────────────────────────────────────────
+
+def precision_at_k(k: int = 5, horizon: str = 'surged_by_5d',
+                   rank_key: str = 'surge_prob') -> dict | None:
+    """스캔일별 상위 K픽 중 실제 급등 비율 — 시스템이 실제로 추천하는 방식 재현.
+
+    기존 '급등 종목 중 합산 40+ 비율' 지표는 가중치를 큰 컴포넌트로 밀면
+    예측력 변화 없이 올라가는 순환 지표였다. 이 지표는 반대로 '내 픽이
+    실제로 맞았는가'를 직접 측정하므로 조작 불가.
+
+    rank_key(기본 surge_prob=GBM 확률)로 정렬, 없으면 raw_combined→combined
+    폴백. below_gate 유니버스 샘플은 픽 후보가 아니므로 제외.
+
+    Returns: {'k', 'horizon', 'n_days', 'precision', 'baseline', 'daily'}
+             (라벨 확정일 3일 미만이면 None)
+    """
+    data = _load()
+    by_day: dict[str, list] = {}
+    labeled_all = 0
+    surged_all  = 0
+    for r in data['records']:
+        if r.get('below_gate'):
+            continue
+        if r.get(horizon) is None:
+            continue
+        labeled_all += 1
+        if r.get(horizon):
+            surged_all += 1
+        by_day.setdefault(r['scan_date'], []).append(r)
+
+    def _rank(r):
+        v = r.get(rank_key)
+        primary = v if v is not None else -1.0
+        return (primary, r.get('raw_combined', r.get('combined', 0)))
+
+    daily = []
+    for d, recs in sorted(by_day.items()):
+        if len(recs) < k:
+            continue   # 픽 K개를 채울 수 없는 날은 제외
+        top  = sorted(recs, key=_rank, reverse=True)[:k]
+        hits = sum(1 for r in top if r.get(horizon))
+        daily.append({'date': d, 'hits': hits, 'k': k})
+
+    if len(daily) < 3:
+        return None
+
+    total_hits = sum(x['hits'] for x in daily)
+    return {
+        'k':         k,
+        'horizon':   horizon,
+        'n_days':    len(daily),
+        'precision': total_hits / (k * len(daily)),
+        'baseline':  (surged_all / labeled_all) if labeled_all else None,
+        'daily':     daily[-10:],   # 최근 10일
+    }
+
+
 # ── 3. 통계 계산 ──────────────────────────────────────────────────────────────
 
 def compute_stats() -> dict | None:
@@ -332,6 +393,19 @@ def build_tracker_section() -> list[str]:
             f'  {_fmt(band_stats["hit_10d"], band_stats["n_10d"]):>10}'
             f'  {_fmt(band_stats["hit_20d"], band_stats["n_20d"]):>10}'
         )
+
+    # ── precision@5: 실전 픽 정밀도 (조작 불가 지표) ──────────────────────
+    for rank_key, rank_label in [('surge_prob', 'GBM확률 랭킹'),
+                                 ('raw_combined', '합산점수 랭킹')]:
+        row = []
+        for hz, hz_label in [('surged_by_3d', '3일'), ('surged_by_5d', '5일')]:
+            p = precision_at_k(k=5, horizon=hz, rank_key=rank_key)
+            if p:
+                base = f' (기저 {p["baseline"]*100:.1f}%)' if p['baseline'] else ''
+                row.append(f'{hz_label} {p["precision"]*100:.1f}%'
+                           f'/{p["n_days"]}일{base}')
+        if row:
+            lines.append(f'  ▶ 상위5픽 정밀도 [{rank_label}]: {" | ".join(row)}')
 
     lines += [
         sep2,

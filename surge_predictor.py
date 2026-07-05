@@ -346,37 +346,39 @@ def combined_score(seoryeok_pts: int, surge_pts: int,
 def predict_surge_timing(seoryeok: int, vol_ratio: float,
                           ma_bull: bool, consec_days: int) -> dict:
     """
-    급등 예상 타이밍 예측 (데이터 학습 기반).
+    급등 '발생 시' 예상 소요일 통계 (조건부 — 생존자 편향 주의).
+
+    ⚠ 주의: 아래 수치는 '스캔 후 실제로 급등한 57건'만 조건화한 통계다.
+      급등하지 않은 스캔은 분모에 없으므로 confidence_pct는 '급등 확률'이
+      아니라 '급등한 케이스 중 3일 내였던 비율'이다. 급등 여부 자체의
+      확률은 surge_prob(GBM)·티어 적중률을 봐야 한다.
 
     분석 결과 (57건 스캔→급등 케이스):
-      거래량 2x+ & 세력80+  → 평균 2.0일 (100% 3일내)
-      세력 70-79            → 평균 2.4일 (78% 3일내)
-      MA정배열              → 평균 1.4일 (100% 3일내)
-      세력80+               → 평균 3.5일 (59% 3일내)
-      거래량압축 & 세력70+   → 평균 3.3일 (61% 3일내)
+      거래량 2x+ & 세력80+  → 평균 2.0일 / 세력 70-79 → 평균 2.4일
+      MA정배열 → 평균 1.4일 / 세력80+ → 평균 3.5일
 
     Returns:
-        expected_days    : 예상 급등 소요 거래일
-        confidence_pct   : 3거래일 내 급등 확률 (%)
+        expected_days    : 급등 시 예상 소요 거래일
+        confidence_pct   : 급등 케이스 중 3거래일 내 비율 (%) — 급등 확률 아님
         timing_label     : 설명 문자열
         holding_advice   : 보유 기간 권고
     """
-    # 조건별 소요일 + 3일내확률 (데이터 기반)
+    # 조건별 소요일 + 급등 케이스 중 3일내 비율 (생존자 통계 — 급등 확률 아님)
     if vol_ratio >= 2.0 and seoryeok >= 80:
         exp_days, conf3d = 2.0, 100
-        label   = '★ 거래량폭발+세력 — 즉시~2일내 급등 기대'
+        label   = '★ 거래량폭발+세력 — 급등 시 즉시~2일내 (과거 급등례 기준)'
         holding = '진입 후 1~3거래일 집중 모니터링'
     elif ma_bull and seoryeok >= 65:
         exp_days, conf3d = 1.4, 100
-        label   = '★ MA정배열+세력 — 1~2일내 빠른 급등'
+        label   = '★ MA정배열+세력 — 급등 시 1~2일내 (과거 급등례 기준)'
         holding = '진입 후 1~2거래일 단기 홀딩'
     elif 70 <= seoryeok < 80:
         exp_days, conf3d = 2.4, 78
-        label   = '세력70대 — 2~3일내 급등 가능성 높음'
+        label   = '세력70대 — 급등 시 2~3일내 (급등례 중 78%)'
         holding = '진입 후 3거래일 보유 권고'
     elif seoryeok >= 80:
         exp_days, conf3d = 3.5, 59
-        label   = '세력80+ — 3~5일내 급등 (59% 확률)'
+        label   = '세력80+ — 급등 시 3~5일내 (급등례 중 59%)'
         holding = '진입 후 3~5거래일 보유'
     elif vol_ratio < 0.3 and seoryeok >= 65:
         exp_days, conf3d = 4.1, 42

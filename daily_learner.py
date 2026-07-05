@@ -533,16 +533,18 @@ def build_email(result: dict) -> tuple[str, str]:
         nw   = upd['new_weights']
         cs   = upd['component_stats']
 
+        p5 = upd.get('precision_at_5')
+        p5_str = f'{p5*100:.1f}%' if p5 is not None else '데이터 부족'
         L += [
             sep,
-            '  [ 모델 가중치 업데이트 결과 ]',
+            '  [ 모델 가중치 업데이트 결과 — lift 기반 (급등 vs 비급등 대조) ]',
             sep,
-            f'  학습 기준: 최근 {upd["window"]}개 관측치  '
-            f'(누적 {upd["total_obs"]}개)',
-            f'  전일 평균 합산점수:  {upd["avg_combined"]:.1f}점',
-            f'  사전 포착률(40점+):  {upd["hit_rate"]*100:.1f}%',
+            f'  학습 기준: 라벨 확정 {upd["window"]}건 (양성 {upd.get("n_pos", "?")}건)  '
+            f'| 급등 관측 누적 {upd["total_obs"]}개',
+            f'  급등 종목 전일 평균 합산점수:  {upd["avg_combined"]:.1f}점',
+            f'  상위5픽 정밀도(precision@5):  {p5_str}',
             '',
-            f'  {"컴포넌트":<12} {"기본값":>7}  {"이전값":>7}  {"신규값":>7}  {"변화":>8}  {"전일 평균점수"}',
+            f'  {"컴포넌트":<12} {"기본값":>7}  {"이전값":>7}  {"신규값":>7}  {"변화":>8}  {"변별력 (급등vs비급등, d)"}',
             sep2,
         ]
 
@@ -556,12 +558,14 @@ def build_email(result: dict) -> tuple[str, str]:
             arrow = ('↑ +' if stat['weight_change'] > 0
                      else ('↓ ' if stat['weight_change'] < 0 else '→  '))
             chg   = f'{arrow}{abs(stat["weight_change"]):.4f}'
-            grade = _score_grade(stat['avg_score'])
+            d     = stat.get('cohens_d')
+            d_str = (f'급등{stat["avg_score"]:5.1f} vs 비급등{stat.get("mu_neg", 0):5.1f} '
+                     f'(d={d:+.3f})') if d is not None else f'{stat["avg_score"]:5.1f}점'
             L.append(
                 f'  {_COMP_LABEL[comp]:<12}'
                 f'  {dw[wkey]:.4f}   {stat["old_weight"]:.4f}'
                 f'   {stat["new_weight"]:.4f}  {chg:>9}'
-                f'  {stat["avg_score"]:5.1f}점 ({grade})'
+                f'  {d_str}'
             )
 
         L.append(sep2)
@@ -576,16 +580,18 @@ def build_email(result: dict) -> tuple[str, str]:
         ]:
             stat  = cs[comp]
             chg   = stat['weight_change']
-            score = stat['avg_score']
+            d     = stat.get('cohens_d')
             arrow = '↑' if chg > 0 else ('↓' if chg < 0 else '→')
-            if score >= 65:
-                reason = f'급등 전날 평균 {score:.1f}점 — 예측력 우수, 가중치 강화'
-            elif score >= 50:
-                reason = f'급등 전날 평균 {score:.1f}점 — 예측력 양호, 소폭 증가'
-            elif score >= 35:
-                reason = f'급등 전날 평균 {score:.1f}점 — 예측력 보통, 현상 유지'
+            if d is None:
+                reason = f'급등 전날 평균 {stat["avg_score"]:.1f}점'
+            elif d >= 0.30:
+                reason = f'변별력 d={d:+.3f} — 급등/비급등을 잘 구분, 가중치 강화'
+            elif d >= 0.10:
+                reason = f'변별력 d={d:+.3f} — 약한 양의 신호, 소폭 반영'
+            elif d >= 0:
+                reason = f'변별력 d={d:+.3f} — 구분력 미미, 가중치 축소'
             else:
-                reason = f'급등 전날 평균 {score:.1f}점 — 예측력 부족, 가중치 축소'
+                reason = f'변별력 d={d:+.3f} — 역상관(비급등에서 더 높음), 바닥 유지'
             L.append(f'  {arrow} {_COMP_LABEL[comp]}: {reason}')
 
         # 피처 중요도
@@ -625,18 +631,21 @@ def build_email(result: dict) -> tuple[str, str]:
         if len(hist) >= 2:
             L += ['', '  [ 가중치 변화 이력 (최근 5회) ]', sep2]
             L.append(
-                f'  {"날짜":<12} {"세력":>7} {"급등":>7} {"수급":>7} {"패턴":>7}  {"포착률":>7}'
+                f'  {"날짜":<12} {"세력":>7} {"급등":>7} {"수급":>7} {"패턴":>7}  {"픽정밀도@5":>9}'
             )
             L.append(sep2)
             for h in hist[-5:]:
                 w = h['weights']
+                p = h.get('precision_at_5')
+                if p is None:
+                    p = h.get('hit_rate', 0)   # 구 이력 하위호환
                 L.append(
                     f'  {h["date"][:10]:<12}'
                     f'  {w.get("W_SEORYEOK",0):.4f}'
                     f'  {w.get("W_SURGE",0):.4f}'
                     f'  {w.get("W_INVESTOR",0):.4f}'
                     f'  {w.get("W_PATTERN",0):.4f}'
-                    f'  {h.get("hit_rate",0)*100:6.1f}%'
+                    f'  {(p or 0)*100:8.1f}%'
                 )
             L.append(sep2)
 

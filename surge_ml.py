@@ -233,7 +233,9 @@ def auto_recalibrate() -> dict:
 
     def calc_tier(fn):
         g = [r for r in records if fn(r)]
-        if len(g) < 5:
+        # 최소 30건: 표본 5건의 적중률은 신뢰구간 ±40%p — 그런 수치로 라이브
+        # 티어 테이블을 매일 덮어쓰면 노이즈에 캘리브레이션이 출렁인다
+        if len(g) < 30:
             return None, None
         pos = sum(1 for r in g if r['surged_by_5d'])
         rate = pos / len(g)
