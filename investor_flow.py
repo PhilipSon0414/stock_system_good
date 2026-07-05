@@ -64,13 +64,29 @@ def _fetch_page(ticker: str, page: int = 1) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-def get_investor_df(ticker: str, days: int = 20) -> pd.DataFrame:
-    """기관/외국인 순매매 DataFrame (최근 days일)"""
+def _parse_end_date(end_date: str | None):
+    """'YYYY-MM-DD' 또는 'YYYYMMDD' → datetime. None이면 None."""
+    if not end_date:
+        return None
+    from datetime import datetime
+    fmt = '%Y-%m-%d' if '-' in end_date else '%Y%m%d'
+    return datetime.strptime(end_date, fmt)
+
+
+def get_investor_df(ticker: str, days: int = 20,
+                    end_date: str | None = None) -> pd.DataFrame:
+    """기관/외국인 순매매 DataFrame (최근 days일).
+    end_date 지정 시 해당일까지의 데이터만 사용 (백데이트 스캔 시 미래 누수 차단)."""
     page1 = _fetch_page(ticker, 1)
     if len(page1) < days:
         page2 = _fetch_page(ticker, 2)
         if not page2.empty:
             page1 = pd.concat([page2, page1]).sort_index()
+    if page1.empty:
+        return pd.DataFrame()
+    end_dt = _parse_end_date(end_date)
+    if end_dt is not None:
+        page1 = page1[page1.index <= end_dt]
     return page1.tail(days) if not page1.empty else pd.DataFrame()
 
 
@@ -89,13 +105,16 @@ def _streak(series: pd.Series) -> int:
     return sign * count
 
 
-def get_pykrx_investor_df(ticker: str, days: int = 20) -> pd.DataFrame:
-    """pykrx 기반 기관/외국인 순매매 (네이버 대비 안정적, 더 많은 일수 지원)"""
+def get_pykrx_investor_df(ticker: str, days: int = 20,
+                          end_date: str | None = None) -> pd.DataFrame:
+    """pykrx 기반 기관/외국인 순매매 (네이버 대비 안정적, 더 많은 일수 지원).
+    end_date 지정 시 해당일까지만 조회 (백데이트 스캔 시 미래 누수 차단)."""
     try:
         from pykrx import stock
         from datetime import datetime, timedelta
-        end   = datetime.now().strftime('%Y%m%d')
-        start = (datetime.now() - timedelta(days=days * 2)).strftime('%Y%m%d')
+        end_dt = _parse_end_date(end_date) or datetime.now()
+        end   = end_dt.strftime('%Y%m%d')
+        start = (end_dt - timedelta(days=days * 2)).strftime('%Y%m%d')
         df = stock.get_market_trading_volume_by_date(start, end, ticker)
         if df is None or df.empty:
             return pd.DataFrame()
@@ -105,9 +124,10 @@ def get_pykrx_investor_df(ticker: str, days: int = 20) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def get_investor_flow_stats(ticker: str) -> dict:
+def get_investor_flow_stats(ticker: str, end_date: str | None = None) -> dict:
     """
     기관/외국인 수급 통계 (pykrx 기반).
+    end_date: 스캔 기준일 — 지정 시 해당일까지의 데이터만 사용.
     Returns:
         inst_streak     : 기관 연속 순매수 일수 (음수=매도)
         frgn_streak     : 외국인 연속 순매수 일수
@@ -117,7 +137,7 @@ def get_investor_flow_stats(ticker: str) -> dict:
         frgn_5d_sum     : 외국인 5일 누적 순매수
         combo_buy       : 기관+외국인 동시 매수 일수 (최근 5일)
     """
-    df = get_pykrx_investor_df(ticker, days=20)
+    df = get_pykrx_investor_df(ticker, days=20, end_date=end_date)
     if df.empty or len(df) < 3:
         return {}
 
@@ -145,14 +165,17 @@ def get_investor_flow_stats(ticker: str) -> dict:
     }
 
 
-def score_investors(ticker: str, ohlcv_df: pd.DataFrame) -> tuple[int, list[str]]:
-    """외국인+기관 수급 점수 (0~100) — pykrx 우선, 네이버 폴백"""
+def score_investors(ticker: str, ohlcv_df: pd.DataFrame,
+                    end_date: str | None = None) -> tuple[int, list[str]]:
+    """외국인+기관 수급 점수 (0~100) — pykrx 우선, 네이버 폴백.
+    end_date: 스캔 기준일('YYYY-MM-DD'|'YYYYMMDD') — 지정 시 해당일까지의
+    수급만 사용한다. 백데이트 스캔/학습 시 급등 이후 수급이 섞이는 누수 차단."""
     # pykrx 데이터 우선 시도
-    pykrx_df = get_pykrx_investor_df(ticker, days=20)
+    pykrx_df = get_pykrx_investor_df(ticker, days=20, end_date=end_date)
     if not pykrx_df.empty and len(pykrx_df) >= 3:
         df = pykrx_df
     else:
-        df = get_investor_df(ticker, days=20)
+        df = get_investor_df(ticker, days=20, end_date=end_date)
 
     if df.empty or len(df) < 3:
         return 0, ['수급데이터 없음']

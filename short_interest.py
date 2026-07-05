@@ -12,8 +12,11 @@ from datetime import datetime, timedelta
 import pandas as pd
 
 
-def get_short_interest(ticker: str) -> dict:
+def get_short_interest(ticker: str, end_date: str | None = None) -> dict:
     """공매도 잔고 비율 및 추세 조회
+
+    end_date: 스캔 기준일('YYYY-MM-DD'|'YYYYMMDD') — 지정 시 해당일까지만 조회
+              (백데이트 스캔 시 미래 데이터 누수 차단)
 
     Returns:
         ratio     : 최근 공매도잔고 비율 (%)
@@ -25,8 +28,13 @@ def get_short_interest(ticker: str) -> dict:
     try:
         from pykrx import stock
 
-        end   = datetime.now().strftime('%Y%m%d')
-        start = (datetime.now() - timedelta(days=30)).strftime('%Y%m%d')
+        if end_date:
+            fmt = '%Y-%m-%d' if '-' in end_date else '%Y%m%d'
+            end_dt = datetime.strptime(end_date, fmt)
+        else:
+            end_dt = datetime.now()
+        end   = end_dt.strftime('%Y%m%d')
+        start = (end_dt - timedelta(days=30)).strftime('%Y%m%d')
 
         df = stock.get_shorting_balance_by_date(start, end, ticker)
         if df is None or df.empty or '공매도잔고' not in df.columns:

@@ -16,9 +16,13 @@ from typing import Optional
 import pandas as pd
 
 
-def check_triple(ticker: str, df: pd.DataFrame) -> dict:
+def check_triple(ticker: str, df: pd.DataFrame,
+                 end_date: str | None = None) -> dict:
     """
     세 조건 체크 후 결과 반환.
+
+    end_date: 스캔 기준일 — 지정 시 공매도/기관 수급을 해당일까지만 조회
+              (백데이트 스캔 시 미래 데이터 누수 차단)
 
     Returns:
         passed        : 세 조건 모두 통과 여부
@@ -47,7 +51,7 @@ def check_triple(ticker: str, df: pd.DataFrame) -> dict:
     # ── 조건 ① : 공매도 잔고 감소 ────────────────────────────────────────
     try:
         from short_interest import get_short_interest
-        si = get_short_interest(ticker)
+        si = get_short_interest(ticker, end_date=end_date)
         if si.get('data_ok'):
             trend = si.get('trend', 'stable')
             change = si.get('change_rate_5d')
@@ -60,7 +64,7 @@ def check_triple(ticker: str, df: pd.DataFrame) -> dict:
 
     # ── 조건 ② : 기관 순매수 전환 ────────────────────────────────────────
     try:
-        inst_days, inst_transition = _check_institutional_flow(ticker)
+        inst_days, inst_transition = _check_institutional_flow(ticker, end_date=end_date)
         result['inst_days'] = inst_days
         if inst_days >= 1 and inst_transition:
             result['inst_ok'] = True
@@ -93,14 +97,21 @@ def check_triple(ticker: str, df: pd.DataFrame) -> dict:
     return result
 
 
-def _check_institutional_flow(ticker: str) -> tuple[int, bool]:
+def _check_institutional_flow(ticker: str,
+                              end_date: str | None = None) -> tuple[int, bool]:
     """
     pykrx로 최근 20일 기관 순매수 데이터 조회.
+    end_date 지정 시 해당일까지만 조회 (백데이트 스캔 시 미래 누수 차단).
     Returns: (연속_순매수_일수, 매도→매수_전환_여부)
     """
     from pykrx import stock
-    end   = datetime.now().strftime('%Y%m%d')
-    start = (datetime.now() - timedelta(days=35)).strftime('%Y%m%d')
+    if end_date:
+        fmt = '%Y-%m-%d' if '-' in end_date else '%Y%m%d'
+        end_dt = datetime.strptime(end_date, fmt)
+    else:
+        end_dt = datetime.now()
+    end   = end_dt.strftime('%Y%m%d')
+    start = (end_dt - timedelta(days=35)).strftime('%Y%m%d')
 
     df = stock.get_market_trading_volume_by_date(start, end, ticker)
     if df is None or df.empty or '기관합계' not in df.columns:
@@ -132,10 +143,11 @@ def _check_institutional_flow(ticker: str) -> tuple[int, bool]:
     return consec, transition
 
 
-def scan_triple_filter(results: list) -> list:
+def scan_triple_filter(results: list, end_date: str | None = None) -> list:
     """
     daily_scan 결과 리스트에서 트리플 필터 조건 체크 후 score 추가.
     results: analyze_one() 결과 딕셔너리 리스트
+    end_date: 스캔 기준일 (백데이트 스캔 시 미래 누수 차단)
     """
     triple_hits  = []
     double_hits  = []
@@ -146,7 +158,7 @@ def scan_triple_filter(results: list) -> list:
         if df is None:
             continue
 
-        tf = check_triple(ticker, df)
+        tf = check_triple(ticker, df, end_date=end_date)
         r['triple_filter'] = tf
 
         if tf['passed']:

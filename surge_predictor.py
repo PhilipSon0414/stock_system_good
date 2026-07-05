@@ -310,6 +310,8 @@ def score_surge_with_history(df: pd.DataFrame, ob_info: dict,
 
     # 현재가 MA20 대비 -10% 이상 이탈: 하락 추세 확인 페널티
     # (MA120 없어도 MA20만으로 단기 추세 파악 가능)
+    latest = df.iloc[-1]
+    close  = latest['Close']
     ma20 = latest.get('MA20', np.nan)
     if not np.isnan(ma20) and ma20 > 0:
         price_vs_ma20 = (close - ma20) / ma20

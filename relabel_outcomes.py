@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Task 6 — record-pull 재라벨링.
+전체 이력 record-pull 재라벨링 (일회성 복구 도구).
 
-문제: forward_tracker.update_outcomes()는 '그날 급등 리스트' 의존 → 실행 공백(예:
-6/23→6/30 7일 갭)에 급등한 종목이 리스트에 없으면 미포착·잘못된 False 라벨.
-
-해결: 각 레코드의 스캔일 이후 N거래일 OHLCV를 직접 조회해 단일일 10%+(종가/전일종가)
-여부를 판정(이벤트-푸시 → 레코드-풀). 급등 정의는 _surge_via_fdr와 동일.
+forward_tracker.update_outcomes()가 이제 동일한 pull 방식으로 미확정(None)
+라벨을 채우므로, 이 스크립트는 과거 push 방식이 남긴 **잘못 확정된 라벨**
+(실행 공백기의 False 오라벨 등)까지 전수 재검증·교정할 때 사용한다.
+급등 판정 로직은 forward_tracker.label_from_ohlcv 단일 정의를 공유한다.
 
 사용:
   python3 relabel_outcomes.py          # dry-run(변경 규모만 보고)
@@ -20,36 +19,9 @@ from pathlib import Path
 warnings.filterwarnings('ignore')
 
 from data_fetcher import get_ohlcv
+from forward_tracker import label_from_ohlcv as _relabel, HORIZONS
 
 SH = Path(__file__).parent / 'score_history.json'
-SURGE_PCT = 0.10
-PRICE_LIMIT = 0.30   # KRX 일간 상하한 — 초과 인접변동 = 분할/권리락 아티팩트(무수정주가)
-HORIZONS = {'surged_by_3d': 3, 'surged_by_5d': 5,
-            'surged_by_10d': 10, 'surged_by_20d': 20}
-
-
-def _relabel(df, scan_date, n):
-    """scan_date 이후 n거래일 내 단일일 10%+ → True / 만료 & 없음 → False / 미성숙 → None.
-    |인접변동|>30%(상하한 초과)는 데이터 아티팩트로 급등 판정에서 제외(Task A)."""
-    idx = [i for i, d in enumerate(df.index) if str(d.date()) <= scan_date]
-    if not idx:
-        return None
-    pos = idx[-1]
-    fut = df.iloc[pos + 1: pos + 1 + n]
-    if len(fut) < n:
-        return None   # 윈도우 미성숙
-    prev = float(df['Close'].iloc[pos])
-    for j in range(len(fut)):
-        c = float(fut['Close'].iloc[j])
-        if prev > 0:
-            chg = c / prev - 1
-            if abs(chg) > PRICE_LIMIT:   # 아티팩트 → 급등 판정 제외, 스케일만 이월
-                prev = c
-                continue
-            if chg >= SURGE_PCT:
-                return True
-        prev = c
-    return False
 
 
 def main():

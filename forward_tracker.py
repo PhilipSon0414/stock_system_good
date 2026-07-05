@@ -3,12 +3,17 @@
 
 흐름:
   1. daily_scan.py 실행 → record_scores()  : 오늘 점수를 score_history.json에 저장
-  2. daily_learner.py 실행 → update_outcomes(): 오늘 급등 종목으로 과거 예측 결과 업데이트
+  2. daily_learner.py 실행 → update_outcomes(): 미확정 기록을 OHLCV로 직접 라벨링
   3. 20 거래일 경과 후 compute_stats()로 점수대별 적중률 계산
   4. build_tracker_section()으로 이메일 섹션 생성
 
 적중 기준: 점수 기록 이후 N 거래일 내 해당 종목이 단일 거래일 10%+ 급등
-거래일 계산: 주말 제외 (공휴일은 미적용, 근사값)
+           (종가/전일종가, |인접변동|>30%는 분할/권리락 아티팩트로 제외)
+
+라벨링 방식: record-pull — 각 미확정 기록의 스캔일 이후 OHLCV를 직접 조회해 판정.
+  기존 push 방식('그날 급등 리스트'에 의존)은 학습기 실행 공백일의 급등을
+  놓치고 False로 오기록했으며, 공휴일을 거래일로 세서 명절 근처 윈도우가
+  일찍 만료됐다. pull 방식은 실제 거래일 인덱스를 세므로 두 문제가 없다.
 """
 
 import json
@@ -20,6 +25,12 @@ SCRIPT_DIR   = Path(__file__).parent
 HISTORY_FILE = SCRIPT_DIR / 'score_history.json'
 
 WINDOWS = [3, 5, 10, 20]   # 추적 윈도우 (거래일)
+
+# 급등 정의 (단일 소스 — relabel_outcomes.py도 이 값을 사용)
+SURGE_PCT   = 0.10   # 단일일 종가/전일종가 +10%
+PRICE_LIMIT = 0.30   # KRX 일간 상하한 — 초과 인접변동 = 분할/권리락 아티팩트(무수정주가)
+HORIZONS    = {'surged_by_3d': 3, 'surged_by_5d': 5,
+               'surged_by_10d': 10, 'surged_by_20d': 20}
 
 
 def _market_regime():
@@ -49,18 +60,32 @@ BANDS = [
 
 # ── 유틸 ──────────────────────────────────────────────────────────────────────
 
-def _td_between(d1: str, d2: str) -> int:
-    """d1(포함) ~ d2(미포함) 거래일 수 (주말 제외)"""
-    dt1 = datetime.strptime(d1, '%Y-%m-%d').date()
-    dt2 = datetime.strptime(d2, '%Y-%m-%d').date()
-    if dt2 <= dt1:
-        return 0
-    count, cur = 0, dt1
-    while cur < dt2:
-        if cur.weekday() < 5:
-            count += 1
-        cur += timedelta(days=1)
-    return count
+def label_from_ohlcv(df, scan_date: str, n: int) -> bool | None:
+    """scan_date 이후 n거래일 내 단일일 10%+(종가/전일종가) 급등 여부.
+
+    Returns: True(급등) / False(윈도우 만료, 급등 없음) / None(윈도우 미성숙)
+    |인접변동|>PRICE_LIMIT(30%)는 분할/권리락 데이터 아티팩트로 급등 판정에서
+    제외하고 가격 스케일만 이월한다. 실제 OHLCV 인덱스를 세므로 공휴일 자동 처리.
+    """
+    idx = [i for i, d in enumerate(df.index) if str(d.date()) <= scan_date]
+    if not idx:
+        return None
+    pos = idx[-1]
+    fut = df.iloc[pos + 1: pos + 1 + n]
+    if len(fut) < n:
+        return None   # 윈도우 미성숙
+    prev = float(df['Close'].iloc[pos])
+    for j in range(len(fut)):
+        c = float(fut['Close'].iloc[j])
+        if prev > 0:
+            chg = c / prev - 1
+            if abs(chg) > PRICE_LIMIT:   # 아티팩트 → 급등 판정 제외, 스케일만 이월
+                prev = c
+                continue
+            if chg >= SURGE_PCT:
+                return True
+        prev = c
+    return False
 
 
 def _load() -> dict:
@@ -158,53 +183,58 @@ def record_scores(results: list, scan_date: str | None = None):
 
 # ── 2. 결과 업데이트 ──────────────────────────────────────────────────────────
 
-def update_outcomes(surge_tickers: list[str], surge_date: str | None = None):
+def update_outcomes(surge_tickers: list[str] | None = None,
+                    surge_date: str | None = None):
     """
-    daily_learner.py가 수집한 급등 종목으로 과거 예측 기록 업데이트.
+    미확정(None) 라벨 기록을 record-pull 방식으로 직접 라벨링.
 
-    surge_date 날 10%+ 급등한 종목이 과거 5/10/20 거래일 내 스캔된 적 있으면
-    해당 기록에 surged_by_Nd = True 마킹.
-    윈도우가 만료된 기록(아직 null)은 False 처리.
+    각 기록의 스캔일 이후 OHLCV를 조회해 N거래일 내 단일일 10%+ 급등 여부를
+    판정한다. 실행 공백일이 있어도 놓친 급등을 다음 실행 때 그대로 복원하고,
+    공휴일도 실제 거래일 인덱스로 자동 처리한다.
 
-    surge_date: 'YYYY-MM-DD' (None이면 오늘)
-    surge_tickers: 당일 급등 종목 코드 목록
+    surge_tickers/surge_date: 구 push 방식 하위호환용 — 더 이상 사용하지 않음.
     """
-    if surge_date is None:
-        surge_date = datetime.now().strftime('%Y-%m-%d')
+    data    = _load()
+    pending = [r for r in data['records']
+               if any(r.get(h) is None for h in HORIZONS)]
+    if not pending:
+        return
 
-    surge_set = set(surge_tickers)
-    data      = _load()
-    updated   = 0
+    try:
+        from data_fetcher import get_ohlcv
+    except Exception as e:
+        print(f'  [추적] 라벨링 스킵 (data_fetcher 로드 실패: {e})')
+        return
 
-    for rec in data['records']:
-        td = _td_between(rec['scan_date'], surge_date)
-        if td <= 0:
+    cache: dict = {}
+    updated = 0
+    failed  = 0
+    for rec in pending:
+        ticker = rec.get('ticker')
+        scan_d = rec.get('scan_date')
+        if not ticker or not scan_d:
             continue
-
-        surged = rec['ticker'] in surge_set
-
-        if 0 < td <= 3  and rec.get('surged_by_3d')  is None and surged:
-            rec['surged_by_3d']  = True; updated += 1
-        if 0 < td <= 5  and rec.get('surged_by_5d')  is None and surged:
-            rec['surged_by_5d']  = True; updated += 1
-        if 0 < td <= 10 and rec.get('surged_by_10d') is None and surged:
-            rec['surged_by_10d'] = True; updated += 1
-        if 0 < td <= 20 and rec.get('surged_by_20d') is None and surged:
-            rec['surged_by_20d'] = True; updated += 1
-
-        # 윈도우 만료 → False
-        if td > 3  and rec.get('surged_by_3d')  is None:
-            rec['surged_by_3d']  = False
-        if td > 5  and rec.get('surged_by_5d')  is None:
-            rec['surged_by_5d']  = False
-        if td > 10 and rec.get('surged_by_10d') is None:
-            rec['surged_by_10d'] = False
-        if td > 20 and rec.get('surged_by_20d') is None:
-            rec['surged_by_20d'] = False
+        if ticker not in cache:
+            try:
+                cache[ticker] = get_ohlcv(ticker, period_days=400)
+            except Exception:
+                cache[ticker] = None
+        df = cache[ticker]
+        if df is None or len(df) < 5:
+            failed += 1
+            continue
+        for h, n in HORIZONS.items():
+            if rec.get(h) is not None:
+                continue
+            label = label_from_ohlcv(df, scan_d, n)
+            if label is not None:
+                rec[h] = label
+                updated += 1
 
     _save(data)
-    if updated:
-        print(f'  [추적] 급등 결과 반영: {updated}건 업데이트 ({surge_date})')
+    if updated or failed:
+        print(f'  [추적] 라벨 확정: {updated}건 '
+              f'(대상 {len(pending)}기록, 조회실패 {failed}종목)')
 
 
 # ── 3. 통계 계산 ──────────────────────────────────────────────────────────────

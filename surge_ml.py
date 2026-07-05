@@ -59,14 +59,14 @@ def get_confidence_tier(seoryeok: int, surge: int,
     """
     Returns:
         tier      : 'S'|'A'|'B'|'C'|'D'
-        hit_rate  : 예상 5일내 20%+ 급등 확률 (0~1)
+        hit_rate  : 예상 5일내 10%+ 급등 확률 (0~1)
         lift      : 기본 대비 배수
         label     : 표시용 문자열
         strategy  : 매매 전략 권고
         ml_prob   : sklearn ML 확률 (없으면 None)
     """
     tier_val = 'D'
-    hit_rate = 0.048
+    hit_rate = 0.183   # 기본값 = Tier-D 기저율 (루프의 (0,0) 티어가 항상 갱신)
     lift     = 1.00
 
     for min_se, min_co, t, rate, lft in _TIERS:

@@ -188,9 +188,13 @@ def analyze_prev_day(ticker: str, surge_date_str: str | None = None) -> dict | N
         df  = analyze(df)
         ob  = get_order_blocks(df)
 
+        # D-1 기준일: 수급 데이터도 D-1까지만 사용해야 함
+        # (기존엔 오늘까지 조회 → 급등일 당일 기관/외국인 매수가 D-1 피처에 누수)
+        prev_day_str = df.index[-1].strftime('%Y-%m-%d')
+
         s_pts,   s_tags   = seoryeok_score(df, ob)
         g_pts,   g_tags   = score_surge(df, ob)
-        inv_pts, inv_tags = score_investors(ticker, df)
+        inv_pts, inv_tags = score_investors(ticker, df, end_date=prev_day_str)
         pat_pts, pat_tags = score_patterns(df)
         combo             = combined_score(s_pts, g_pts, inv_pts, pat_pts)
 

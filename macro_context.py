@@ -326,12 +326,18 @@ _POSITIVE_KEYWORDS = [
 ]
 
 
-def get_dart_flags(ticker: str, days: int = 3) -> dict:
-    """dart_utils 모듈 위임 — 공시 긍/부정 분류."""
+def get_dart_flags(ticker: str, days: int = 3,
+                   end_date: str | None = None) -> dict:
+    """dart_utils 모듈 위임 — 공시 긍/부정 분류.
+    end_date: 스캔 기준일('YYYY-MM-DD'|'YYYYMMDD') — 지정 시 해당일 기준 조회
+              (백데이트 스캔 시 미래 공시 누수 차단)."""
     try:
         from dart_utils import get_dart_disclosures, classify_dart_impact
-        today = datetime.now().strftime('%Y-%m-%d')
-        info   = get_dart_disclosures(ticker, today, lookback_days=days)
+        if end_date:
+            base = end_date if '-' in end_date else f'{end_date[:4]}-{end_date[4:6]}-{end_date[6:]}'
+        else:
+            base = datetime.now().strftime('%Y-%m-%d')
+        info   = get_dart_disclosures(ticker, base, lookback_days=days)
         impact = classify_dart_impact(info)
         return {
             'has_negative': info.get('has_negative', False),

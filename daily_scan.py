@@ -110,6 +110,16 @@ SCORE_HISTORY_PATH       = Path(__file__).parent / 'score_history.json'
 
 # 날짜 기준 스캔 (None이면 오늘, 'YYYYMMDD'이면 해당 종가 기준)
 _SCAN_END_DATE: str | None = None
+
+
+def _scan_date_str() -> str:
+    """스캔 기준일을 'YYYY-MM-DD'로 반환. 백데이트 스캔이면 그 날짜, 아니면 오늘.
+    이력 조회·기록 저장이 datetime.now() 대신 이 값을 쓰게 해 백데이트 스캔 시
+    미래 스캔 기록이 섞이거나 기록 날짜가 오늘로 저장되는 누수를 막는다."""
+    if _SCAN_END_DATE:
+        s = _SCAN_END_DATE
+        return s if '-' in s else f'{s[:4]}-{s[4:6]}-{s[6:]}'
+    return datetime.now().strftime('%Y-%m-%d')
 # 데이터검증(2026-06): 연속2일=0%, 연속3일+=2.8% (기저율14.9% 대비 역효과)
 # 연속 출현 = 이미 급등이 반영된 종목 → 신규 진입 시점 지남
 # → 연속 보너스 완전 제거, 신규 신호(1일)만 소폭 유지
@@ -163,7 +173,7 @@ def _get_ticker_score_history(ticker: str, limit: int = 5) -> list[dict]:
         return []
     try:
         records = json.loads(SCORE_HISTORY_PATH.read_text(encoding='utf-8')).get('records', [])
-        today   = datetime.now().strftime('%Y-%m-%d')
+        today   = _scan_date_str()   # 백데이트 스캔 시 미래 기록 차단
         hist    = sorted(
             [r for r in records if r['ticker'] == ticker and r['scan_date'] < today],
             key=lambda r: r['scan_date'], reverse=True
@@ -207,7 +217,7 @@ def _get_consecutive_days() -> dict:
         return {}
     try:
         records = json.loads(SCORE_HISTORY_PATH.read_text(encoding='utf-8')).get('records', [])
-        today = datetime.now().strftime('%Y-%m-%d')
+        today = _scan_date_str()   # 백데이트 스캔 시 미래 기록 차단
         dates = sorted(
             {r['scan_date'] for r in records if r['scan_date'] < today},
             reverse=True
@@ -335,7 +345,7 @@ def analyze_one(ticker: str) -> dict | None:
         # score_history에서 직전 5일 합산/세력 이력 로드 (통계 피처용)
         _sh_hist = _get_ticker_score_history(ticker, limit=5)
         surge_pts, surge_tags = score_surge_with_history(df, ob, _sh_hist)
-        inv_pts,   inv_tags   = score_investors(ticker, df)
+        inv_pts,   inv_tags   = score_investors(ticker, df, end_date=_SCAN_END_DATE)
         pat_pts,   pat_tags   = score_patterns(df)
         combo = combined_score(s_pts, surge_pts, inv_pts, pat_pts)
 
@@ -401,17 +411,17 @@ def analyze_one(ticker: str) -> dict | None:
 
         vol_ratio = round(df['VolRatio'].iloc[-1], 2) if 'VolRatio' in df.columns else 0
         fin   = get_financials(ticker)
-        short = get_short_interest(ticker)
+        short = get_short_interest(ticker, end_date=_SCAN_END_DATE)
 
         # ── 트리플 필터 ─────────────────────────────────────────────────
         from triple_filter import check_triple
-        triple = check_triple(ticker, df)
+        triple = check_triple(ticker, df, end_date=_SCAN_END_DATE)
 
         # ── 기관/외국인 흐름 통계 (pykrx) ──────────────────────────────
-        inv_stats = get_investor_flow_stats(ticker)
+        inv_stats = get_investor_flow_stats(ticker, end_date=_SCAN_END_DATE)
 
         # ── DART 부정 공시 필터 ──────────────────────────────────────
-        dart_info = get_dart_flags(ticker, days=3)
+        dart_info = get_dart_flags(ticker, days=3, end_date=_SCAN_END_DATE)
 
         # ── 현재가 vs MA20 위치 계산 ────────────────────────────────────
         import math as _math
@@ -545,27 +555,30 @@ def run_scan(market: str = 'ALL') -> list:
         for r in results:
             days = consec_map.get(r['ticker'], 0)
             if days >= 1:
-                bonus = PERSISTENCE_BONUS_TABLE.get(min(days, 4), 30)
-
-                # 차트 하향 시 보너스 상한 제한
-                df_r = r.get('df')
-                if df_r is not None and len(df_r) > 0:
-                    latest_r  = df_r.iloc[-1]
-                    ma20_r    = latest_r.get('MA20', float('nan'))
-                    close_r   = latest_r.get('Close', 0)
-                    import math
-                    if not math.isnan(float(ma20_r)) and ma20_r > 0:
-                        gap = (close_r - ma20_r) / ma20_r
-                        if gap < -0.10:
-                            # 현재가가 MA20 아래 10%+ → 보너스 절반
-                            bonus = bonus // 2
-                            r['s_tags'] = [f'⚠ MA20 이탈({gap*100:.0f}%)로 연속보너스 제한'] + r['s_tags']
-
-                r['combined']  = min(100, r['combined'] + bonus)
+                # PERSISTENCE_BONUS_TABLE에 없는 연속일수(2일+)는 보너스 0
+                # (기존 기본값 30은 검증상 적중 0~2.8% 구간에 최대 보너스를 주던 버그)
+                bonus = PERSISTENCE_BONUS_TABLE.get(min(days, 4), 0)
                 r['consec_days'] = days
-                label = f'★ {days}일 연속등장 보너스 (+{bonus}점)'
-                r['s_tags'] = [label] + r['s_tags']
-                bonus_count += 1
+
+                if bonus > 0:
+                    # 차트 하향 시 보너스 상한 제한
+                    df_r = r.get('df')
+                    if df_r is not None and len(df_r) > 0:
+                        latest_r  = df_r.iloc[-1]
+                        ma20_r    = latest_r.get('MA20', float('nan'))
+                        close_r   = latest_r.get('Close', 0)
+                        import math
+                        if not math.isnan(float(ma20_r)) and ma20_r > 0:
+                            gap = (close_r - ma20_r) / ma20_r
+                            if gap < -0.10:
+                                # 현재가가 MA20 아래 10%+ → 보너스 절반
+                                bonus = bonus // 2
+                                r['s_tags'] = [f'⚠ MA20 이탈({gap*100:.0f}%)로 연속보너스 제한'] + r['s_tags']
+
+                    r['combined']  = min(100, r['combined'] + bonus)
+                    label = f'★ {days}일 연속등장 보너스 (+{bonus}점)'
+                    r['s_tags'] = [label] + r['s_tags']
+                    bonus_count += 1
         if bonus_count:
             print(f'  연속등장 보너스: {bonus_count}개 종목 적용')
 
@@ -600,7 +613,7 @@ def run_scan(market: str = 'ALL') -> list:
     results = results[:TOP_N_REPORT]
 
     # 트리플 필터 + 앙상블 스코어링 실행
-    triple_hits, double_hits = scan_triple_filter(results)
+    triple_hits, double_hits = scan_triple_filter(results, end_date=_SCAN_END_DATE)
     if triple_hits:
         print(f'  트리플 필터 통과: {len(triple_hits)}종목 | 더블: {len(double_hits)}종목')
 
@@ -1150,7 +1163,7 @@ def build_report(results: list, scan_market: str) -> str:
     lines.append('')
 
     # ── 📌 직전 집중 픽 추적 (carry-over: 거래량 감소로 사라진 종목도 끝까지 추적) ──
-    scan_date_str = (_SCAN_END_DATE or now.strftime('%Y-%m-%d'))
+    scan_date_str = _scan_date_str()
     carry = _render_carryover(scan_date_str)
     if carry:
         lines += carry
@@ -1741,7 +1754,10 @@ def main(market: str = 'ALL', scan_date: str | None = None):
         return
 
     # 오늘 점수 추적 기록 (+ ② 탈락 유니버스 샘플 = 학습 음성)
-    record_scores(results + getattr(run_scan, '_universe_sample', []))
+    # scan_date 명시: 백데이트 스캔 기록이 오늘 날짜로 저장돼 라벨 윈도우가
+    # 오염되는 문제 차단
+    record_scores(results + getattr(run_scan, '_universe_sample', []),
+                  scan_date=_scan_date_str())
 
     report_text = build_report(results, market)
     print('\n' + report_text)
